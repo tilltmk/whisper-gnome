@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Whisper models
+models/
+*.pt
+*.bin
+
+# Temporary files
+*.log
+/tmp/
+*.swp
+*.swo
+*~
+
+# User-specific
+.env
+*.local
+
+# OS
+.DS_Store
+Thumbs.db

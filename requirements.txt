@@ -1,0 +1,6 @@
+sounddevice
+numpy
+pycairo
+PyGObject
+pynput
+faster-whisper
