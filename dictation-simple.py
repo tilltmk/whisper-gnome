@@ -125,10 +125,10 @@ def load_model():
 
     try:
         print("[INFO] Lade Whisper-Modell...")
-        # Verwende base-Modell für schnelle Transkription
-        # device="cpu" für Kompatibilität, compute_type="int8" für Geschwindigkeit
-        whisper_model = WhisperModel("base", device="cpu", compute_type="int8")
-        print("[INFO] Whisper-Modell geladen")
+        # Verwende medium-Modell für guten Kompromiss zwischen Qualität und Geschwindigkeit
+        # device="cpu" für Stabilität (CUDNN-Bibliothek fehlt/inkompatibel)
+        whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
+        print("[INFO] Whisper-Modell geladen (medium, CPU, int8)")
         return True
     except Exception as e:
         print(f"[FEHLER] Konnte Whisper-Modell nicht laden: {e}")
