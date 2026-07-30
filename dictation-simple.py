@@ -19,7 +19,21 @@ from faster_whisper import WhisperModel
 SAMPLE_RATE = 16000
 MAX_RECORDING_TIME = 300  # 5 Minuten Maximum
 PAUSE_THRESHOLD = 5.0  # Automatischer Stopp nach 5 Sekunden Pause
-SILENCE_THRESHOLD = 0.02  # Audio-Level unter dem als Stille gilt
+SILENCE_THRESHOLD = 0.02  # Obergrenze fuer die Stille-Schwelle (laute Mikrofone)
+
+# Pegel-Aufbereitung. Manches interne Laptop-Mikrofon (DMIC) liefert einen konstanten
+# Gleichspannungsanteil von ca. -0.23 und einen sehr leisen Nutzpegel. Ohne
+# DC-Abzug misst jede Pegelmessung nur den Offset, und ohne Normalisierung
+# bekommt Whisper ein Signal um -50 dBFS.
+NOISE_CALIBRATION_TIME = 0.5  # Sekunden zur Messung des Grundrauschens
+SILENCE_FACTOR = 3.0  # Stille = unterhalb des X-fachen Grundrauschens
+SILENCE_FLOOR = 0.002  # Untergrenze, damit leise Mikros nicht endlos laufen
+TARGET_PEAK = 0.8  # Ziel-Aussteuerung vor der Transkription
+MIN_SIGNAL_LEVEL = 1e-4  # Darunter gilt die Aufnahme als leer
+SETTLE_TIME = 0.3  # Einschwing-Transiente des DMIC am Anfang verwerfen
+LEVEL_PERCENTILE = 99.5  # Bezugsgroesse fuer die Aussteuerung (statt Peak)
+MAX_GAIN = 150.0  # Deckel, damit Stille nicht zu Whisper-Halluzinationen wird
+
 STATE_FILE = f"/tmp/dictation-state-{os.getenv('USER')}"
 OSD_FILE = f"/tmp/dictation-osd-{os.getenv('USER')}"
 
@@ -135,6 +149,73 @@ def load_model():
         return False
 
 
+def has_default_source():
+    """Prueft, ob PipeWire eine Default-Aufnahmequelle kennt."""
+    try:
+        result = subprocess.run(
+            ["pw-metadata", "-n", "default"],
+            capture_output=True, text=True, timeout=5
+        )
+        return "default.audio.source" in result.stdout
+    except Exception as e:
+        print(f"[DEBUG] Konnte Default-Quelle nicht pruefen: {e}")
+        return True  # Im Zweifel weitermachen und den Stream versuchen
+
+
+def recover_audio_input():
+    """Repariert eine fehlende Aufnahmequelle durch WirePlumber-Neustart.
+
+    Auf manchen AMD-Laptops (ACP-Audio) registriert sich die DMIC-Karte teils erst
+    Minuten nach WirePlumber. Die HDA-Karte wird dann ohne UCM angelegt und
+    verliert das Profil mit den internen Mikrofonen - es bleibt nur die leere
+    Klinkenbuchse, also gar keine Default-Quelle. Ein Neustart laesst
+    WirePlumber neu proben, diesmal mit vorhandener DMIC-Karte.
+    """
+    print("[INFO] Keine Aufnahmequelle - starte WirePlumber neu")
+    try:
+        subprocess.run(
+            ["systemctl", "--user", "restart", "wireplumber"],
+            capture_output=True, timeout=15, check=True
+        )
+    except Exception as e:
+        print(f"[FEHLER] WirePlumber-Neustart fehlgeschlagen: {e}")
+        return False
+
+    # WirePlumber braucht einen Moment, bis die Karten neu geprobt sind
+    for _ in range(20):
+        time.sleep(0.5)
+        if has_default_source():
+            print("[INFO] Aufnahmequelle wiederhergestellt")
+            return True
+
+    print("[FEHLER] Auch nach Neustart keine Aufnahmequelle")
+    return False
+
+
+def open_input_stream(callback):
+    """Oeffnet den Aufnahme-Stream, mit einem Reparaturversuch bei Fehlern."""
+    def _open():
+        return sd.InputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype='float32',
+            callback=callback
+        )
+
+    if not has_default_source():
+        recover_audio_input()
+
+    try:
+        return _open()
+    except Exception as e:
+        # Typisch: PaErrorCode -9999 / ALSA -2, wenn das 'default'-PCM die
+        # Default-Quelle nicht aufloesen kann.
+        print(f"[FEHLER] Mikrofon nicht verfuegbar: {e}")
+        if not recover_audio_input():
+            raise
+        return _open()
+
+
 def record_audio():
     """Nimmt Audio auf bis manuell gestoppt oder 8s Pause erkannt."""
     global stop_recording_flag
@@ -149,8 +230,15 @@ def record_audio():
     max_silence_frames = int(PAUSE_THRESHOLD * SAMPLE_RATE)
     auto_stopped = False
 
+    # Adaptive Stille-Schwelle: das Grundrauschen wird zu Beginn gemessen,
+    # statt eine feste Schwelle zu raten. Das interne DMIC liegt bei ~0.003,
+    # ein USB-Mikrofon deutlich hoeher - eine feste Schwelle passt nie zu beiden.
+    calibration_frames = int(NOISE_CALIBRATION_TIME * SAMPLE_RATE)
+    calibration_levels = []
+    silence_threshold = None
+
     def audio_callback(indata, frames, time_info, status):
-        nonlocal total_frames, silence_frames, auto_stopped
+        nonlocal total_frames, silence_frames, auto_stopped, silence_threshold
 
         if stop_recording_flag:
             raise sd.CallbackStop()
@@ -158,9 +246,26 @@ def record_audio():
         audio_data.append(indata.copy())
         total_frames += frames
 
-        # Prüfe auf Stille (8 Sekunden Pause)
-        audio_level = np.abs(indata).mean()
-        if audio_level < SILENCE_THRESHOLD:
+        # Pegel ohne Gleichspannungsanteil messen. Das DMIC liefert einen
+        # konstanten Offset von ca. -0.23; ohne Abzug misst man nur den.
+        block = indata[:, 0] if indata.ndim > 1 else indata
+        audio_level = float(np.abs(block - block.mean()).mean())
+
+        if total_frames < calibration_frames:
+            calibration_levels.append(audio_level)
+            return  # Waehrend der Kalibrierung nicht auf Stille pruefen
+
+        if silence_threshold is None:
+            # 25. Perzentil ist robust gegen den Einschwing-Transienten am
+            # Anfang und gegen sofort einsetzendes Sprechen.
+            noise_floor = float(np.percentile(calibration_levels, 25)) if calibration_levels else 0.0
+            silence_threshold = min(
+                max(noise_floor * SILENCE_FACTOR, SILENCE_FLOOR),
+                SILENCE_THRESHOLD
+            )
+            print(f"[DEBUG] Grundrauschen {noise_floor:.5f} -> Stille-Schwelle {silence_threshold:.5f}")
+
+        if audio_level < silence_threshold:
             silence_frames += frames
             if silence_frames >= max_silence_frames:
                 auto_stopped = True
@@ -173,13 +278,11 @@ def record_audio():
             raise sd.CallbackStop()
 
     try:
-        with sd.InputStream(
-            samplerate=SAMPLE_RATE,
-            channels=1,
-            dtype='float32',
-            callback=audio_callback
-        ):
-            while total_frames < max_frames and not stop_recording_flag:
+        with open_input_stream(audio_callback) as stream:
+            # stream.active statt total_frames pruefen: nach CallbackStop
+            # kommen keine Callbacks mehr, total_frames waechst nicht weiter
+            # und die Schleife wuerde sonst endlos drehen.
+            while stream.active and not stop_recording_flag:
                 sd.sleep(100)
     except sd.CallbackStop:
         pass
@@ -188,6 +291,37 @@ def record_audio():
         result = np.concatenate(audio_data, axis=0).flatten()
         return result, auto_stopped
     return None, False
+
+
+def prepare_audio(audio_np):
+    """Entfernt den Gleichspannungsanteil und steuert das Signal aus.
+
+    Whisper erwartet ein um Null zentriertes Signal. Das interne DMIC liefert
+    einen Offset von ca. -0.23 bei einem Nutzpegel um 0.003 - ohne Aufbereitung
+    besteht die Aufnahme fast nur aus Offset.
+    """
+    # Die ersten Millisekunden enthalten den Einschwing-Transienten des DMIC
+    # (gemessen ~15x lauter als das Nutzsignal). Er wuerde jede Aussteuerung
+    # verfaelschen, deshalb faellt er weg - aber nur, wenn genug uebrig bleibt.
+    settle_samples = int(SETTLE_TIME * SAMPLE_RATE)
+    if len(audio_np) > settle_samples * 2:
+        audio_np = audio_np[settle_samples:]
+
+    audio_np = audio_np - audio_np.mean()
+
+    # Hohes Perzentil statt Maximum: einzelne Ausreisser (Tastenklick,
+    # Restspitzen) bestimmen sonst den Gain und druecken die Sprache weg.
+    level = float(np.percentile(np.abs(audio_np), LEVEL_PERCENTILE))
+    if level < MIN_SIGNAL_LEVEL:
+        print(f"[DEBUG] Signal zu schwach (Pegel {level:.6f}) - nicht normalisiert")
+        return audio_np
+
+    gain = min(TARGET_PEAK / level, MAX_GAIN)
+    print(f"[DEBUG] Pegel {level:.5f} -> Verstaerkung {gain:.1f}x")
+
+    # Clipping nach der Verstaerkung: die obersten 0.5% werden begrenzt,
+    # das ist hoerbar unkritisch und verhindert Ueberlauf.
+    return np.clip(audio_np * gain, -1.0, 1.0)
 
 
 def transcribe_audio(audio_np):
@@ -205,6 +339,8 @@ def transcribe_audio(audio_np):
     try:
         duration = len(audio_np) / SAMPLE_RATE
         print(f"[INFO] Transkribiere {duration:.1f}s Audio...")
+
+        audio_np = prepare_audio(audio_np)
 
         # Transkribiere mit faster-whisper
         # language="de" für Deutsch, beam_size=5 für gute Qualität
