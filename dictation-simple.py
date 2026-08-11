@@ -11,9 +11,59 @@ import subprocess
 import threading
 from pathlib import Path
 
+
+def _ensure_cuda_libs():
+    """Macht die per pip installierten NVIDIA-Bibliotheken fuer CTranslate2 auffindbar.
+
+    libcudnn/libcublas liegen in den pip-Paketen (nvidia-cudnn-cu12 usw.) und damit
+    ausserhalb des ldconfig-Pfads. Der dynamische Linker liest LD_LIBRARY_PATH nur
+    beim Prozessstart, deshalb wird der Pfad gesetzt und der Prozess einmalig ersetzt.
+    Ohne das faellt CTranslate2 auf die CPU zurueck.
+    """
+    if os.environ.get("DICTATION_CUDA_PATH_SET"):
+        return
+
+    import site
+
+    bases = list(site.getsitepackages())
+    user_site = site.getusersitepackages()
+    if user_site not in bases:
+        bases.append(user_site)
+
+    lib_dirs = []
+    for base in bases:
+        for package in ("cudnn", "cublas", "cuda_runtime"):
+            lib_dir = os.path.join(base, "nvidia", package, "lib")
+            if os.path.isdir(lib_dir) and lib_dir not in lib_dirs:
+                lib_dirs.append(lib_dir)
+
+    os.environ["DICTATION_CUDA_PATH_SET"] = "1"
+    if not lib_dirs:
+        return
+
+    existing = os.environ.get("LD_LIBRARY_PATH", "")
+    os.environ["LD_LIBRARY_PATH"] = os.pathsep.join(
+        lib_dirs + ([existing] if existing else [])
+    )
+    os.environ["PYTHONUNBUFFERED"] = "1"
+    os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+_ensure_cuda_libs()
+
 import sounddevice as sd
 import numpy as np
 from faster_whisper import WhisperModel
+
+# Transkriptions-Modelle in absteigender Qualitaet: (Modell, Geraet, Genauigkeit, Cache).
+# large-v3 auf einer 8-G-NVIDIA-Karte ist bei deutschem Diktat deutlich genauer als medium und
+# dabei schneller (10 s Audio in ~0.9 s statt ~6 s auf der CPU). Der CPU-Eintrag greift
+# nur, wenn CUDA/cuDNN fehlt - large-v3 auf der CPU waere dafuer zu langsam.
+LARGE_V3_CACHE = str(Path.home() / ".cache" / "whisper")
+MODEL_CANDIDATES = [
+    ("large-v3", "cuda", "float16", LARGE_V3_CACHE),
+    ("medium", "cpu", "int8", None),
+]
 
 # Konfiguration
 SAMPLE_RATE = 16000
@@ -137,16 +187,20 @@ def load_model():
     if whisper_model is not None:
         return True
 
-    try:
-        print("[INFO] Lade Whisper-Modell...")
-        # Verwende medium-Modell für guten Kompromiss zwischen Qualität und Geschwindigkeit
-        # device="cpu" für Stabilität (CUDNN-Bibliothek fehlt/inkompatibel)
-        whisper_model = WhisperModel("medium", device="cpu", compute_type="int8")
-        print("[INFO] Whisper-Modell geladen (medium, CPU, int8)")
-        return True
-    except Exception as e:
-        print(f"[FEHLER] Konnte Whisper-Modell nicht laden: {e}")
-        return False
+    for name, device, compute_type, cache in MODEL_CANDIDATES:
+        try:
+            print(f"[INFO] Lade Whisper-Modell {name} ({device}, {compute_type})...")
+            kwargs = {"download_root": cache} if cache else {}
+            whisper_model = WhisperModel(
+                name, device=device, compute_type=compute_type, **kwargs
+            )
+            print(f"[INFO] Whisper-Modell geladen ({name}, {device}, {compute_type})")
+            return True
+        except Exception as e:
+            print(f"[WARN] {name} auf {device} nicht nutzbar: {e}")
+
+    print("[FEHLER] Konnte kein Whisper-Modell laden")
+    return False
 
 
 def has_default_source():
