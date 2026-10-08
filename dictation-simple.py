@@ -59,10 +59,29 @@ from faster_whisper import WhisperModel
 # large-v3 auf einer 8-G-NVIDIA-Karte ist bei deutschem Diktat deutlich genauer als medium und
 # dabei schneller (10 s Audio in ~0.9 s statt ~6 s auf der CPU). Der CPU-Eintrag greift
 # nur, wenn CUDA/cuDNN fehlt - large-v3 auf der CPU waere dafuer zu langsam.
+#
+# large-v3-turbo ist das neueste MEHRSPRACHIGE Modell der
+# faster-whisper-Registry (-> mobiuslabsgmbh/faster-whisper-large-v3-turbo). Es laedt
+# anonym, ohne Hugging-Face-Login, und wurde nach dem Download mit HF_HUB_OFFLINE=1
+# gegengeprueft: Laden geht rein aus dem lokalen Cache, ohne Netz.
+#
+# Es bleibt bewusst ZWEITE Wahl und ersetzt large-v3 nicht. Der destillierte
+# 4-Schicht-Dekoder ist rund halb so gross und erheblich schneller, verliert aber
+# gegenueber large-v3 bei Eigennamen und Fachbegriffen - und genau die machen dieses
+# Diktat aus. Der Eintrag greift darum nur, wenn large-v3 nicht in den VRAM passt.
+#
+# Die CPU-Rueckfallebene ist von "medium" auf large-v3-turbo umgestellt: vergleichbar
+# gross (809M vs. 769M Parameter), aber mit dem vollen large-v3-Encoder und damit
+# deutlich genauer bei gleichem Rechenaufwand.
+#
+# NICHT eintragen: die distil-*-Modelle der Registry (distil-large-v2/v3/v3.5) sind
+# ENGLISCHSPRACHIG. Sie sehen in der Liste nach dem neuesten Stand aus, liefern bei
+# deutschem Diktat aber Unsinn.
 LARGE_V3_CACHE = str(Path.home() / ".cache" / "whisper")
 MODEL_CANDIDATES = [
     ("large-v3", "cuda", "float16", LARGE_V3_CACHE),
-    ("medium", "cpu", "int8", None),
+    ("large-v3-turbo", "cuda", "float16", LARGE_V3_CACHE),
+    ("large-v3-turbo", "cpu", "int8", LARGE_V3_CACHE),
 ]
 
 # Konfiguration
@@ -271,7 +290,18 @@ def open_input_stream(callback):
 
 
 def record_audio():
-    """Nimmt Audio auf bis manuell gestoppt oder 8s Pause erkannt."""
+    """Nimmt Audio auf bis manuell gestoppt oder 8s Pause erkannt.
+
+    Oeffnet den Stream in einem eigenen Hintergrund-Thread. Mit dem USB-Mikro-
+    USB-Mikro (USB-Mikro) kann stream.close() beim Beenden 15-20s dauern oder
+    ganz haengen bleiben - PortAudio/ALSA-Teardown, keine Python-Exception,
+    reproduzierbar bei praktisch jedem Stopp. Lief das synchron im Aufrufer
+    (process_dictation), blieb dessen globales recording-Flag bis zum
+    naechsten Dienst-Neustart auf True stehen, und der Hotkey tat nichts
+    mehr ausser "Stoppe Aufnahme manuell" zu loggen. Die Aufnahme ist mit
+    dem letzten Callback vollstaendig; der Thread schliesst den Stream
+    danach unabhaengig weiter und blockiert niemanden mehr.
+    """
     global stop_recording_flag
 
     audio_data = []
@@ -331,15 +361,57 @@ def record_audio():
         if total_frames >= max_frames:
             raise sd.CallbackStop()
 
-    try:
-        with open_input_stream(audio_callback) as stream:
+    capture_done = threading.Event()
+
+    def capture_worker():
+        try:
+            stream = open_input_stream(audio_callback)
+            stream.start()
+        except Exception as e:
+            print(f"[FEHLER] Aufnahme-Stream konnte nicht geoeffnet werden: {e}")
+            capture_done.set()
+            return
+
+        try:
             # stream.active statt total_frames pruefen: nach CallbackStop
             # kommen keine Callbacks mehr, total_frames waechst nicht weiter
             # und die Schleife wuerde sonst endlos drehen.
             while stream.active and not stop_recording_flag:
                 sd.sleep(100)
-    except sd.CallbackStop:
-        pass
+        except sd.CallbackStop:
+            pass
+        finally:
+            # Ab hier ist audio_data vollstaendig - der Aufrufer muss nicht
+            # auf den (potenziell haengenden) Stream-Abbau unten warten.
+            capture_done.set()
+
+        try:
+            stream.stop()
+            stream.close()
+        except Exception as e:
+            print(f"[DEBUG] Stream-Abbau-Fehler (ignoriert): {e}")
+
+    threading.Thread(target=capture_worker, daemon=True).start()
+
+    # Der Hang sitzt nicht immer beim Schliessen - manchmal haengt schon
+    # open_input_stream()/stream.start() nativ, bevor der Worker ueberhaupt
+    # die Polling-Schleife erreicht und stop_recording_flag das erste Mal
+    # sieht. Ohne Frist wuerde recording in process_dictation() dann trotz
+    # Fix auf Dauer True bleiben. Die Frist laeuft erst NACHDEM ein Stop
+    # angefordert wurde, damit legitime lange Aufnahmen (bis
+    # MAX_RECORDING_TIME) nicht abgeschnitten werden.
+    GRACE_AFTER_STOP = 2.0
+    stop_requested_at = None
+    while not capture_done.is_set():
+        if stop_recording_flag and stop_requested_at is None:
+            stop_requested_at = time.monotonic()
+        if (
+            stop_requested_at is not None
+            and time.monotonic() - stop_requested_at > GRACE_AFTER_STOP
+        ):
+            print("[FEHLER] Aufnahme-Stream reagiert nicht auf Stop - gebe auf")
+            break
+        capture_done.wait(timeout=0.1)
 
     if audio_data:
         result = np.concatenate(audio_data, axis=0).flatten()
