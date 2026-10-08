@@ -53,35 +53,50 @@ _ensure_cuda_libs()
 
 import sounddevice as sd
 import numpy as np
-from faster_whisper import WhisperModel
 
-# Transkriptions-Modelle in absteigender Qualitaet: (Modell, Geraet, Genauigkeit, Cache).
-# large-v3 auf einer 8-G-NVIDIA-Karte ist bei deutschem Diktat deutlich genauer als medium und
-# dabei schneller (10 s Audio in ~0.9 s statt ~6 s auf der CPU). Der CPU-Eintrag greift
-# nur, wenn CUDA/cuDNN fehlt - large-v3 auf der CPU waere dafuer zu langsam.
+# ─── Transkription: Cohere Transcribe, KEIN Whisper ──────────────────────────
 #
-# large-v3-turbo ist das neueste MEHRSPRACHIGE Modell der
-# faster-whisper-Registry (-> mobiuslabsgmbh/faster-whisper-large-v3-turbo). Es laedt
-# anonym, ohne Hugging-Face-Login, und wurde nach dem Download mit HF_HUB_OFFLINE=1
-# gegengeprueft: Laden geht rein aus dem lokalen Cache, ohne Netz.
+# Whisper ist hier ausdruecklich nicht gewuenscht;
+# `faster_whisper` wird nicht mehr importiert und es gibt bewusst keine
+# Whisper-Rueckfallebene. Wenn Cohere nicht laedt, soll das auffallen und nicht
+# stillschweigend durch Whisper ersetzt werden.
 #
-# Es bleibt bewusst ZWEITE Wahl und ersetzt large-v3 nicht. Der destillierte
-# 4-Schicht-Dekoder ist rund halb so gross und erheblich schneller, verliert aber
-# gegenueber large-v3 bei Eigennamen und Fachbegriffen - und genau die machen dieses
-# Diktat aus. Der Eintrag greift darum nur, wenn large-v3 nicht in den VRAM passt.
+# Modell: cohere-transcribe-03-2026, ein 2B-Modell mit conformer-basiertem
+# Encoder-Decoder, Audio rein und Text raus, 14 Sprachen inklusive Deutsch.
+# Es liegt vollstaendig lokal, der Ordner enthaelt `model.safetensors` (3,9 G)
+# und den eigenen Modellcode (modeling_cohere_asr.py und drei weitere).
 #
-# Die CPU-Rueckfallebene ist von "medium" auf large-v3-turbo umgestellt: vergleichbar
-# gross (809M vs. 769M Parameter), aber mit dem vollen large-v3-Encoder und damit
-# deutlich genauer bei gleichem Rechenaufwand.
+# WARUM trust_remote_code NOETIG IST: transformers 4.57.1 kennt die Klasse
+# `CohereAsrForConditionalGeneration` noch nicht eingebaut (geprueft:
+# hasattr(transformers, ...) == False). Das Modell bringt sie per `auto_map`
+# selbst mit, und die wird beim Laden ausgefuehrt. Der Code wurde vor der
+# Umstellung durchgesehen: nur librosa/numpy/soundfile/torch, keine Netz-,
+# Prozess- oder Dateizugriffe ausser dem Vokabular-Speichern des Tokenizers.
+# Wird der Ordner je ersetzt, gehoert diese Durchsicht wiederholt.
 #
-# NICHT eintragen: die distil-*-Modelle der Registry (distil-large-v2/v3/v3.5) sind
-# ENGLISCHSPRACHIG. Sie sehen in der Liste nach dem neuesten Stand aus, liefern bei
-# deutschem Diktat aber Unsinn.
-LARGE_V3_CACHE = str(Path.home() / ".cache" / "whisper")
+# `librosa` ist eine Abhaengigkeit des Modellcodes und wurde dafuer nachgezogen
+# (--user, Version 1.0.0). Ohne sie schlaegt bereits der Import fehl.
+#
+# bfloat16 UND NICHT float16 - das ist der entscheidende Punkt. Der Modellcode
+# maskiert Aufmerksamkeitswerte mit hart kodierten -1e9
+# (modeling_cohere_asr.py, Zeilen 326, 839, 850). float16 reicht nur bis
+# +-65504, eine Milliarde passt dort nicht hinein, und das Laden gelingt noch,
+# die Transkription scheitert dann aber mit
+#   "value cannot be converted to type c10::Half without overflow"
+# Genau in diese Falle laeuft auch das offizielle Beispiel im Modell-Steckbrief.
+# bfloat16 hat denselben Wertebereich wie float32 (bis ~3,4e38) bei halber
+# Genauigkeit der Mantisse, damit passt -1e9 und der Speicherbedarf bleibt bei
+# rund 4 G. GPUs ab Ampere (Compute Capability 8.0) rechnen bfloat16 in Hardware.
+#
+# float32 auf der GPU ist KEINE Option: 2B Parameter waeren rund 8 G, zu viel
+# fuer eine 8-G-Karte. Die CPU-Ebene ist nur eine Notloesung, auf ihr ist das
+# Modell sehr langsam - aber immer noch besser als keine Diktierfunktion.
+COHERE_MODEL_PATH = str(Path.home() / ".cache" / "cohere-transcribe")
+TRANSCRIBE_LANGUAGE = "de"
+MAX_NEW_TOKENS = 440  # deckt die 300 s Hoechstaufnahmedauer ab
 MODEL_CANDIDATES = [
-    ("large-v3", "cuda", "float16", LARGE_V3_CACHE),
-    ("large-v3-turbo", "cuda", "float16", LARGE_V3_CACHE),
-    ("large-v3-turbo", "cpu", "int8", LARGE_V3_CACHE),
+    ("cuda", "bfloat16"),
+    ("cpu", "float32"),
 ]
 
 # Konfiguration
@@ -93,7 +108,7 @@ SILENCE_THRESHOLD = 0.02  # Obergrenze fuer die Stille-Schwelle (laute Mikrofone
 # Pegel-Aufbereitung. Manches interne Laptop-Mikrofon (DMIC) liefert einen konstanten
 # Gleichspannungsanteil von ca. -0.23 und einen sehr leisen Nutzpegel. Ohne
 # DC-Abzug misst jede Pegelmessung nur den Offset, und ohne Normalisierung
-# bekommt Whisper ein Signal um -50 dBFS.
+# bekommt das Modell ein Signal um -50 dBFS.
 NOISE_CALIBRATION_TIME = 0.5  # Sekunden zur Messung des Grundrauschens
 SILENCE_FACTOR = 3.0  # Stille = unterhalb des X-fachen Grundrauschens
 SILENCE_FLOOR = 0.002  # Untergrenze, damit leise Mikros nicht endlos laufen
@@ -101,7 +116,7 @@ TARGET_PEAK = 0.8  # Ziel-Aussteuerung vor der Transkription
 MIN_SIGNAL_LEVEL = 1e-4  # Darunter gilt die Aufnahme als leer
 SETTLE_TIME = 0.3  # Einschwing-Transiente des DMIC am Anfang verwerfen
 LEVEL_PERCENTILE = 99.5  # Bezugsgroesse fuer die Aussteuerung (statt Peak)
-MAX_GAIN = 150.0  # Deckel, damit Stille nicht zu Whisper-Halluzinationen wird
+MAX_GAIN = 150.0  # Deckel, damit Stille nicht zu erfundenem Text wird
 
 STATE_FILE = f"/tmp/dictation-state-{os.getenv('USER')}"
 OSD_FILE = f"/tmp/dictation-osd-{os.getenv('USER')}"
@@ -111,7 +126,8 @@ recording = False
 stop_recording_flag = False
 last_trigger_time = 0
 overlay_process = None
-whisper_model = None
+asr_model = None
+asr_processor = None
 
 
 def play_sound(sound_type="start"):
@@ -200,25 +216,56 @@ def stop_overlay():
 
 
 def load_model():
-    """Lädt das Whisper-Modell."""
-    global whisper_model
+    """Laedt Cohere Transcribe. Kein Whisper, auch nicht als Rueckfallebene."""
+    global asr_model, asr_processor
 
-    if whisper_model is not None:
+    if asr_model is not None:
         return True
 
-    for name, device, compute_type, cache in MODEL_CANDIDATES:
+    if not os.path.isdir(COHERE_MODEL_PATH):
+        print(f"[FEHLER] Modellordner fehlt: {COHERE_MODEL_PATH}")
+        return False
+
+    # Erst hier importieren, nicht beim Start des Daemons: transformers und torch
+    # brauchen mehrere Sekunden und belegen Speicher. Der Daemon soll auf den
+    # Hotkey reagieren koennen, bevor je transkribiert wurde.
+    try:
+        import torch
+        from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+    except Exception as e:
+        print(f"[FEHLER] transformers/torch nicht nutzbar: {e}")
+        return False
+
+    for device, dtype_name in MODEL_CANDIDATES:
+        if device == "cuda" and not torch.cuda.is_available():
+            print("[WARN] CUDA nicht verfuegbar, ueberspringe GPU")
+            continue
         try:
-            print(f"[INFO] Lade Whisper-Modell {name} ({device}, {compute_type})...")
-            kwargs = {"download_root": cache} if cache else {}
-            whisper_model = WhisperModel(
-                name, device=device, compute_type=compute_type, **kwargs
+            print(f"[INFO] Lade Cohere Transcribe ({device}, {dtype_name})...")
+            if asr_processor is None:
+                asr_processor = AutoProcessor.from_pretrained(
+                    COHERE_MODEL_PATH, trust_remote_code=True
+                )
+            modell = AutoModelForSpeechSeq2Seq.from_pretrained(
+                COHERE_MODEL_PATH,
+                trust_remote_code=True,
+                dtype=getattr(torch, dtype_name),
             )
-            print(f"[INFO] Whisper-Modell geladen ({name}, {device}, {compute_type})")
+            asr_model = modell.to(device).eval()
+            print(f"[INFO] Cohere Transcribe geladen ({device}, {dtype_name})")
             return True
         except Exception as e:
-            print(f"[WARN] {name} auf {device} nicht nutzbar: {e}")
+            print(f"[WARN] Cohere auf {device} nicht nutzbar: {e}")
+            # Halb geladene Gewichte auf der GPU wieder freigeben, sonst steht
+            # der VRAM dem naechsten Versuch nicht zur Verfuegung.
+            asr_model = None
+            if device == "cuda":
+                try:
+                    torch.cuda.empty_cache()
+                except Exception:
+                    pass
 
-    print("[FEHLER] Konnte kein Whisper-Modell laden")
+    print("[FEHLER] Konnte Cohere Transcribe nicht laden")
     return False
 
 
@@ -422,7 +469,7 @@ def record_audio():
 def prepare_audio(audio_np):
     """Entfernt den Gleichspannungsanteil und steuert das Signal aus.
 
-    Whisper erwartet ein um Null zentriertes Signal. Das interne DMIC liefert
+    Das Modell erwartet ein um Null zentriertes Signal. Das interne DMIC liefert
     einen Offset von ca. -0.23 bei einem Nutzpegel um 0.003 - ohne Aufbereitung
     besteht die Aufnahme fast nur aus Offset.
     """
@@ -451,38 +498,80 @@ def prepare_audio(audio_np):
 
 
 def transcribe_audio(audio_np):
-    """Transkribiert Audio mit Whisper."""
-    global whisper_model
+    """Transkribiert Audio mit Cohere Transcribe."""
+    global asr_model, asr_processor
 
     if audio_np is None or len(audio_np) == 0:
         return ""
 
     # Lade Modell falls nicht geladen
-    if whisper_model is None:
+    if asr_model is None:
         if not load_model():
             return ""
 
     try:
+        import torch
+
         duration = len(audio_np) / SAMPLE_RATE
         print(f"[INFO] Transkribiere {duration:.1f}s Audio...")
 
         audio_np = prepare_audio(audio_np)
 
-        # Transkribiere mit faster-whisper
-        # language="de" für Deutsch, beam_size=5 für gute Qualität
-        segments, info = whisper_model.transcribe(
-            audio_np,
-            language="de",
-            beam_size=5,
-            vad_filter=False  # VAD deaktiviert (benötigt onnxruntime)
+        # Der Prozessor erwartet float32-Mono. Er setzt die Abtastrate selbst um
+        # und zerlegt lange Aufnahmen in Stuecke; der dabei entstehende
+        # audio_chunk_index MUSS unten ans Dekodieren weitergegeben werden,
+        # sonst werden die Stuecke falsch zusammengesetzt.
+        inputs = asr_processor(
+            audio=np.asarray(audio_np, dtype=np.float32),
+            sampling_rate=SAMPLE_RATE,
+            return_tensors="pt",
+            language=TRANSCRIBE_LANGUAGE,
+        )
+        inputs = inputs.to(asr_model.device, dtype=asr_model.dtype)
+
+        # decoder_attention_mask MUSS hier mitgegeben werden, sonst bricht
+        # generate() ab mit "'NoneType' object has no attribute 'new_ones'".
+        # Grund: die generate() des Modells schreibt den Schluessel
+        # bedingungslos in die Argumente, auch als None - und das ist genau der
+        # Fall bei reiner Audio-Transkription ohne Textprompt. transformers
+        # 4.57.1 prueft in _update_model_kwargs_for_generation nur, OB der
+        # Schluessel da ist, nicht ob er einen Wert hat, und ruft dann
+        # .new_ones() darauf. Der Modellcode faengt 4.52-4.55 und >=5.3 ab,
+        # 4.57 fiel durch die Luecke.
+        #
+        # Eine Spalte Einsen ist inhaltlich korrekt: der Dekoder startet mit
+        # genau einem Token (decoder_start_token_id), und transformers haengt
+        # je Schritt selbst eine weitere Spalte an.
+        decoder_attention_mask = torch.ones(
+            (inputs["input_features"].shape[0], 1),
+            dtype=torch.long,
+            device=asr_model.device,
         )
 
-        # Sammle alle Segmente
-        text_parts = []
-        for segment in segments:
-            text_parts.append(segment.text.strip())
+        with torch.inference_mode():
+            outputs = asr_model.generate(
+                **inputs,
+                decoder_attention_mask=decoder_attention_mask,
+                max_new_tokens=MAX_NEW_TOKENS,
+            )
 
-        text = " ".join(text_parts).strip()
+        # batch_decode und NICHT decode: generate() liefert eine Zeile je
+        # Stapel-Eintrag, und die decode() des Prozessors reicht einfach an
+        # tokenizer.decode() weiter, die nur eine einzelne Sequenz kann
+        # ("int() argument must be ... not 'list'").
+        #
+        # Die Zusatzargumente audio_chunk_index und language aus dem
+        # Modell-Steckbrief werden bewusst NICHT uebergeben: dieser
+        # Modellspiegel kennt sie nicht (processing_cohere_asr.py reicht
+        # decode/batch_decode ungefiltert an den Tokenizer durch), der
+        # Steckbrief beschreibt eine neuere Prozessor-Fassung.
+        decoded = asr_processor.batch_decode(outputs, skip_special_tokens=True)
+        # decode() liefert bei diesem Modell eine Liste, bei anderen Pfaden einen
+        # String - beides abfangen, damit ein Modell-Update nichts zerreisst.
+        if isinstance(decoded, (list, tuple)):
+            text = " ".join(str(t).strip() for t in decoded if t).strip()
+        else:
+            text = str(decoded).strip()
 
         if text:
             print(f"[INFO] Transkribiert: {text[:100]}{'...' if len(text) > 100 else ''}")
