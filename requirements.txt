@@ -1,6 +1,12 @@
+# Diktier-Daemon
 sounddevice
 numpy
+# Cohere Transcribe (Modellcode braucht librosa und soundfile)
+torch
+transformers>=4.57
+librosa
+soundfile
+# Overlay und Hotkey-Monitor
 pycairo
 PyGObject
 pynput
-faster-whisper

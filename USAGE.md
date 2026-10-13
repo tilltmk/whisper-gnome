@@ -62,7 +62,7 @@ pkill -f "dictation-simple.py"
 
 ## Technische Details
 
-- **Whisper Modell:** medium (CPU-Modus)
-- **Sprache:** Deutsch (automatische Erkennung)
+- **Modell:** Cohere Transcribe (2B, bfloat16 auf der GPU)
+- **Sprache:** Deutsch (`TRANSCRIBE_LANGUAGE`)
 - **Clipboard:** wl-copy/wl-paste (Wayland)
 - **IPC:** File-based trigger (/tmp/dictation-state-$USER)

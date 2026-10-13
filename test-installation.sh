@@ -1,106 +1,55 @@
 #!/bin/bash
-# Test-Script für KI-Diktierung Installation
+# Prüft die Installation der KI-Diktierung (Cohere Transcribe)
+
+GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
+PY="${PYTHON:-python3}"
+MODELL="$HOME/.cache/cohere-transcribe"
+fehler=0
+
+ok()     { echo -e "${GREEN}OK${NC}${1:+ ($1)}"; }
+fehlt()  { echo -e "${RED}FEHLT${NC}${1:+ ($1)}"; fehler=1; }
+hinweis(){ echo -e "${YELLOW}$1${NC}"; }
 
 echo "======================================"
 echo " KI-Diktierung - Installationstest"
 echo "======================================"
-echo ""
 
-# Farben
-GREEN='\033[0;32m'
-RED='\033[0;31m'
-YELLOW='\033[1;33m'
-NC='\033[0m' # No Color
+echo -n "Python ............................ "
+V=$($PY --version 2>&1) && ok "$V" || fehlt
 
-# Test 1: Virtual Environment
-echo -n "Test 1: Virtual Environment... "
-if [ -d "$HOME/.local/share/ai-dictation/venv" ]; then
-    echo -e "${GREEN}OK${NC}"
+for m in numpy sounddevice transformers librosa soundfile; do
+    printf "%-35s " "Paket $m"
+    $PY -c "import $m" 2>/dev/null && ok || fehlt "pip install --user -r requirements.txt"
+done
+
+echo -n "PyTorch mit CUDA .................. "
+C=$($PY -c "import torch; print(torch.cuda.is_available(), torch.version.cuda)" 2>/dev/null)
+case "$C" in True*) ok "CUDA ${C#True }";; False*) hinweis "nur CPU - Diktierung sehr langsam";; *) fehlt;; esac
+
+echo -n "bfloat16 auf der GPU .............. "
+B=$($PY -c "import torch; print(torch.cuda.is_available() and torch.cuda.is_bf16_supported())" 2>/dev/null)
+[ "$B" = "True" ] && ok || hinweis "nicht verfügbar"
+
+echo -n "Cohere-Transcribe-Modell .......... "
+[ -f "$MODELL/model.safetensors" ] && [ -f "$MODELL/modeling_cohere_asr.py" ] && ok "$MODELL" || fehlt "siehe README"
+
+echo -n "wl-copy (Zwischenablage) .......... "
+command -v wl-copy >/dev/null && ok || fehlt "Paket wl-clipboard"
+
+echo -n "systemd-Dienst .................... "
+if systemctl --user cat ai-dictation.service >/dev/null 2>&1; then
+    ok "$(systemctl --user is-active ai-dictation.service)"
 else
-    echo -e "${RED}FEHLT${NC}"
-    exit 1
+    hinweis "nicht eingerichtet (siehe README)"
 fi
 
-# Test 2: Python 3.13
-echo -n "Test 2: Python 3.13... "
-PYTHON_VERSION=$($HOME/.local/share/ai-dictation/venv/bin/python --version 2>&1)
-if [[ $PYTHON_VERSION == *"3.13"* ]]; then
-    echo -e "${GREEN}OK${NC} ($PYTHON_VERSION)"
-else
-    echo -e "${RED}FEHLER${NC} ($PYTHON_VERSION)"
-fi
+echo -n "Transkriptions-Socket ............. "
+S="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ai-dictation-asr.sock"
+[ -S "$S" ] && ok "$S" || hinweis "nicht vorhanden (Daemon läuft nicht?)"
 
-# Test 3: Faster-Whisper installiert
-echo -n "Test 3: Faster-Whisper... "
-if $HOME/.local/share/ai-dictation/venv/bin/python -c "import faster_whisper" 2>/dev/null; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FEHLT${NC}"
-    exit 1
-fi
-
-# Test 4: PyTorch + CUDA
-echo -n "Test 4: PyTorch mit CUDA... "
-CUDA_AVAILABLE=$($HOME/.local/share/ai-dictation/venv/bin/python -c "import torch; print(torch.cuda.is_available())" 2>/dev/null)
-if [[ $CUDA_AVAILABLE == "True" ]]; then
-    CUDA_VERSION=$($HOME/.local/share/ai-dictation/venv/bin/python -c "import torch; print(torch.version.cuda)" 2>/dev/null)
-    echo -e "${GREEN}OK${NC} (CUDA $CUDA_VERSION)"
-else
-    echo -e "${YELLOW}CPU-Modus${NC} (GPU nicht verfügbar)"
-fi
-
-# Test 5: sounddevice
-echo -n "Test 5: Audio-Aufnahme (sounddevice)... "
-if $HOME/.local/share/ai-dictation/venv/bin/python -c "import sounddevice" 2>/dev/null; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FEHLT${NC}"
-fi
-
-# Test 6: pynput
-echo -n "Test 6: Tastatur-Events (pynput)... "
-if $HOME/.local/share/ai-dictation/venv/bin/python -c "import pynput" 2>/dev/null; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FEHLT${NC}"
-fi
-
-# Test 7: xdotool
-echo -n "Test 7: Text-Eingabe (xdotool)... "
-if command -v xdotool &> /dev/null; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FEHLT${NC}"
-fi
-
-# Test 8: Autostart konfiguriert
-echo -n "Test 8: Autostart-Eintrag... "
-if [ -f "$HOME/.config/autostart/ai-dictation.desktop" ]; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${YELLOW}NICHT KONFIGURIERT${NC}"
-fi
-
-# Test 9: Scripts ausführbar
-echo -n "Test 9: Scripts ausführbar... "
-if [ -x "$HOME/.local/share/ai-dictation/start-dictation.sh" ] && [ -x "$HOME/.local/share/ai-dictation/dictation-simple.py" ]; then
-    echo -e "${GREEN}OK${NC}"
-else
-    echo -e "${RED}FEHLER${NC}"
-fi
+echo -n "GNOME-Shortcut .................... "
+gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings 2>/dev/null | grep -q dictation && ok || hinweis "setup-gnome-shortcut.sh ausführen"
 
 echo ""
-echo "======================================"
-echo " Zusammenfassung"
-echo "======================================"
-echo ""
-echo "Installation: ${GREEN}Erfolgreich${NC}"
-echo ""
-echo "Zum Starten:"
-echo "  ~/.local/share/ai-dictation/start-dictation.sh"
-echo ""
-echo "Hotkey: Beide Shift-Tasten + Space"
-echo ""
-echo "Dokumentation:"
-echo "  ~/.local/share/ai-dictation/README.md"
-echo ""
+[ $fehler -eq 0 ] && echo -e "${GREEN}Installation vollständig.${NC}" || echo -e "${RED}Es fehlt etwas - siehe oben.${NC}"
+exit $fehler

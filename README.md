@@ -1,251 +1,146 @@
-# KI-Diktierung mit Faster-Whisper (Deutsch)
+# KI-Diktierung für GNOME – jetzt mit Cohere Transcribe
 
-Lokale Spracherkennung mit Faster-Whisper Large-v3, mit GPU-Beschleunigung (NVIDIA, CUDA).
+Lokale Spracherkennung per Tastenkürzel: sprechen, Text landet in der
+Zwischenablage. Läuft komplett offline auf der eigenen NVIDIA-GPU.
 
-## Features
+> **Neu: Cohere Transcribe statt Whisper.**
+> Die Diktierung nutzt jetzt [Cohere Transcribe](https://huggingface.co/CohereLabs/cohere-transcribe-03-2026)
+> (`cohere-transcribe-03-2026`), ein 2-Milliarden-Parameter-Modell mit Conformer-Encoder,
+> 14 Sprachen inklusive Deutsch, Apache-2.0-Lizenz. Whisper ist vollständig entfernt –
+> auch nicht als Rückfallebene.
 
-- **100% lokal** - Keine Cloud, alle Daten bleiben auf deinem System
-- **GPU-beschleunigt** - Nutzt eine NVIDIA-GPU mit CUDA
-- **Large-v3 Modell** - Bestes Modell für deutsche Spracherkennung
-- **Animiertes Overlay** - Lila radiale Wellen während der Aufnahme
-- **GNOME-Integration** - Nativ über GNOME Keyboard Shortcuts
-- **Toggle-Steuerung** - Gleiche Taste zum Starten und Stoppen
-- **Keine Auto-Pause** - Du kontrollierst wann die Aufnahme endet
+## Wie schnell?
+
+Gemessen mit einer gemeinfreien LibriVox-Lesung (Kafka, *Die Verwandlung*, Kapitel 1,
+[archive.org](https://archive.org/details/verwandlung_mw_0811_librivox)).
+Das Modell war bereits geladen, bfloat16 auf einer Laptop-GPU mit 8 GB VRAM:
+
+| Audio | Transkribiert in | Tempo |
+|---|---|---|
+| 10 Sekunden | 0,34 s | 29× Echtzeit |
+| 1 Minute | 0,71 s | 84× Echtzeit |
+| 5 Minuten | 2,81 s | 107× Echtzeit |
+| **41 Minuten (ganzes Kapitel)** | **21,5 s** | **115× Echtzeit** |
+
+**Wortfehlerrate: 0,8 %** auf 6.104 Wörtern. Verglichen wurde mit dem Originaltext
+von Project Gutenberg, ohne Groß-/Kleinschreibung und Satzzeichen.
+
+Einordnung: Das ist eine saubere, vorgelesene Aufnahme. Spontane Sprache, Hall
+oder Störgeräusche ergeben höhere Fehlerraten. Ein typisches Diktat von
+10–30 Sekunden ist praktisch sofort in der Zwischenablage.
+
+## Funktionen
+
+- **100 % lokal** – kein Audio verlässt den Rechner
+- **Tastenkürzel** über GNOME (Vorgabe: Shift + Strg + Leertaste), gleiche Taste startet und stoppt
+- **Automatischer Stopp** nach 5 Sekunden Stille, höchstens 5 Minuten je Aufnahme
+- **Lange Diktate** werden an leisen Stellen in Stücke ≤ 35 s zerlegt (die Obergrenze des Modells)
+- **Pegel-Aufbereitung** für leise oder versetzte Mikrofone (DC-Abzug, Aussteuerung)
+- **Animiertes Overlay** während der Aufnahme
+- **Transkriptions-Dienst** für andere lokale Programme über einen Unix-Socket (siehe unten)
+
+## Voraussetzungen
+
+- Linux mit GNOME (Wayland), PipeWire, `wl-copy`
+- NVIDIA-GPU mit CUDA und mindestens ~5 GB freiem VRAM; bfloat16-Hardware ab Ampere empfohlen
+- Python 3.14 mit den Paketen aus `requirements.txt`
 
 ## Installation
 
-Das System ist bereits installiert in:
-- Python-Umgebung: `~/.local/share/ai-dictation/venv/`
-- Whisper-Modell: `large-v3` (wird beim ersten Start heruntergeladen, ~3GB)
+```bash
+git clone https://github.com/tilltmk/whisper-gnome.git ~/.local/share/ai-dictation
+pip install --user -r ~/.local/share/ai-dictation/requirements.txt
 
-## Einrichtung
+# Modell (~3,9 GB) nach ~/.cache/cohere-transcribe – das offizielle Repo erfordert
+# die Annahme der Nutzungsbedingungen auf Hugging Face und ein Zugriffstoken.
+hf download CohereLabs/cohere-transcribe-03-2026 --local-dir ~/.cache/cohere-transcribe
+```
 
-### 1. GNOME Shortcut konfigurieren
+Das Modell bringt eigenen Modellcode mit und wird deshalb mit `trust_remote_code=True`
+geladen. Wer den Modellordner austauscht, sollte diesen Code vorher durchsehen.
+
+### Als Dienst starten
+
+`~/.config/systemd/user/ai-dictation.service`:
+
+```ini
+[Unit]
+Description=AI Dictation Daemon
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/python3.14 -u %h/.local/share/ai-dictation/dictation-simple.py
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target
+```
 
 ```bash
+systemctl --user daemon-reload
+systemctl --user enable --now ai-dictation.service
 ~/.local/share/ai-dictation/setup-gnome-shortcut.sh
 ```
 
-Das Script versucht automatisch einen GNOME Shortcut zu erstellen.
-
-**Falls automatische Konfiguration nicht klappt:**
-1. Öffne GNOME Einstellungen → Tastatur
-2. Scrolle zu "Eigene Tastenkombinationen"
-3. Klicke auf "+"
-4. Name: `KI-Diktierung`
-5. Befehl: `~/.local/share/ai-dictation/trigger-dictation.sh`
-6. Tastenkombination: Drücke beide Shift-Tasten + Space gleichzeitig
-
-**Alternative Tastenkombinationen** (falls beide Shift nicht funktioniert):
-- `Super+D`
-- `Ctrl+Alt+Space`
-- `Super+Space`
-
-### 2. Daemon starten
-
-```bash
-~/.local/share/ai-dictation/start-dictation.sh
-```
-
-Der Daemon:
-- Lädt das large-v3 Modell beim Start (~3GB Download beim ersten Mal)
-- Läuft permanent im Hintergrund
-- Wartet auf Hotkey-Trigger
-
 ## Nutzung
 
-### Diktieren
+1. Tastenkürzel drücken – Ton und Overlay zeigen die laufende Aufnahme
+2. Sprechen
+3. Tastenkürzel erneut drücken oder 5 Sekunden schweigen
+4. `Strg+V` – der Text ist in der Zwischenablage
 
-1. **Start**: Drücke deine konfigurierte Tastenkombination (z.B. beide Shift + Space)
-   - Sound wird abgespielt
-   - Animiertes lila Overlay erscheint rechts unten
-   - Notification: "🔴 AUFNAHME LÄUFT"
+## Speicher und Rückfallebenen
 
-2. **Sprechen**: Sprich deinen Text (Deutsch)
-   - Keine Angst vor Pausen - kein automatisches Stoppen
-   - Overlay zeigt Animation während Aufnahme
+| | |
+|---|---|
+| Modell auf der GPU | ~3,7 GB Gewichte (bfloat16), insgesamt ~4,7 GB VRAM |
+| Modell bleibt geladen | ab dem ersten Diktat, damit jedes weitere sofort startet |
+| GPU voll (anderer Prozess) | kein Ausweichen auf die CPU, das nächste Diktat versucht es erneut |
+| CPU-Ebene | nur ohne CUDA **und** mit ≥ 12 GB freiem RAM (float32, ~8 GB, langsam) |
 
-3. **Stoppen**: Drücke dieselbe Tastenkombination nochmal
-   - Overlay verschwindet
-   - Notification: "⏹️ Aufnahme gestoppt - Transkribiere..."
+**Warum bfloat16 und nicht float16?** Der Modellcode maskiert Aufmerksamkeitswerte mit
+fest kodierten `-1e9`. float16 reicht nur bis ±65.504, die Transkription bricht dann mit
+`value cannot be converted to type c10::Half without overflow` ab. bfloat16 hat den
+Wertebereich von float32 bei halbem Speicherbedarf.
 
-4. **Einfügen**: Text ist in Zwischenablage
-   - Drücke `Strg+V` zum Einfügen
-   - Notification zeigt erkannten Text an
+## Transkriptions-Dienst für andere Programme
 
-### Automatischer Start beim Login
+Eine zweite Kopie des Modells passt neben der Diktierung nicht auf eine 8-GB-Karte.
+Der Daemon bietet die bereits geladene Instanz deshalb über einen Unix-Socket an:
+`$XDG_RUNTIME_DIR/ai-dictation-asr.sock`, nur für den eigenen Benutzer lesbar (0600).
 
-Wenn du den Daemon automatisch beim Login starten möchtest:
+Protokoll: eine JSON-Zeile hin, JSON-Zeilen zurück.
+
+```json
+{"aktion": "transkribieren", "audio": "/pfad/eingang.f32", "rate": 16000, "sprache": "de",
+ "abschnitte": [[0, 160000], [160000, 240000]]}
+```
+
+- `audio`: float32-Rohdaten, mono, 16 kHz, eigene Datei mit Endung `.f32`
+- `abschnitte`: `[Offset, Länge]` in Samples, je höchstens 35 s
+- Antworten: `{"fortschritt": n, "gesamt": m}` während der Arbeit, am Ende `{"ok": true, "texte": [...]}`
+- `{"aktion": "status"}` liefert, ob und wo das Modell geladen ist
+
+Diktieren hat Vorrang: Ein Diktat wartet höchstens einen Stapel (~1–2 s GPU).
+Läuft das Modell auf der CPU, werden fremde Aufträge abgelehnt.
+
+## Fehlersuche
 
 ```bash
-mkdir -p ~/.config/autostart
-cat > ~/.config/autostart/ai-dictation.desktop << 'EOF'
-[Desktop Entry]
-Type=Application
-Name=KI-Diktierung (Faster-Whisper)
-Exec=~/.local/share/ai-dictation/start-dictation.sh
-Hidden=false
-NoDisplay=false
-X-GNOME-Autostart-enabled=true
-EOF
+journalctl --user -u ai-dictation -f      # Live-Log
+systemctl --user restart ai-dictation      # Neustart
+~/.local/share/ai-dictation/test-installation.sh
 ```
 
-## Konfiguration
+- **Keine Aufnahmequelle:** Auf manchen AMD-Laptops registriert sich das interne
+  Mikrofon erst nach WirePlumber. Der Daemon startet WirePlumber dann selbst neu.
+- **„Grafikspeicher belegt“:** Ein anderer Prozess hält den VRAM. Das nächste Diktat versucht es erneut.
+- **Schlechte Erkennung:** näher ans Mikrofon, Störgeräusche reduzieren. Die Sprache ist
+  in `TRANSCRIBE_LANGUAGE` festgelegt (Vorgabe `de`).
 
-Die Einstellungen können in `~/.local/share/ai-dictation/dictation-simple.py` angepasst werden:
+## Lizenz
 
-```python
-SAMPLE_RATE = 16000               # Audio-Samplerate
-MAX_RECORDING_TIME = 300          # Max. 5 Minuten
-MODEL_NAME = "large-v3"           # Whisper-Modell
-DEVICE = "cuda"                   # GPU-Beschleunigung
-COMPUTE_TYPE = "float16"          # für NVIDIA-GPUs mit Tensor-Cores
-```
-
-### Andere Whisper-Modelle
-
-Verfügbare Modelle (aufsteigend nach Qualität/Größe):
-- `tiny` - Schnellstes, niedrigste Qualität (~40MB)
-- `base` - Schnell, okay Qualität (~75MB)
-- `small` - Gut, etwas langsamer (~250MB)
-- `medium` - Sehr gut, moderat (~770MB)
-- **`large-v3`** - **Standard** - Beste Qualität (~3GB)
-
-Zum Ändern: Zeile 21 in `dictation-simple.py` anpassen und Daemon neu starten.
-
-## Troubleshooting
-
-### Hotkey funktioniert nicht
-
-**Problem**: Tastenkombination wird nicht erkannt.
-
-**Lösung**:
-1. Prüfe ob GNOME Shortcut konfiguriert ist:
-   ```bash
-   gsettings get org.gnome.settings-daemon.plugins.media-keys custom-keybindings
-   ```
-
-2. Falls nicht: Führe `setup-gnome-shortcut.sh` aus oder konfiguriere manuell (siehe Einrichtung)
-
-3. Falls "beide Shift + Space" nicht funktioniert: Nutze alternative Tastenkombination
-
-### Overlay erscheint nicht
-
-**Problem**: Kein animiertes Fenster bei Aufnahme.
-
-**Lösung**:
-1. Prüfe ob GTK3 verfügbar:
-   ```bash
-   python3 -c "import gi; gi.require_version('Gtk', '3.0'); from gi.repository import Gtk"
-   ```
-
-2. Prüfe Daemon-Logs:
-   ```bash
-   tail -f /tmp/dictation-daemon.log
-   ```
-
-3. Teste Overlay manuell:
-   ```bash
-   touch /tmp/dictation-state-$USER
-   ~/.local/share/ai-dictation/venv/bin/python3 ~/.local/share/ai-dictation/animated_overlay.py
-   ```
-
-### Kein Ton / Audio-Aufnahme funktioniert nicht
-
-Prüfe ob PulseAudio/PipeWire läuft:
-```bash
-pactl info
-```
-
-Mikrofon testen:
-```bash
-arecord -d 5 test.wav && aplay test.wav
-```
-
-### GPU nicht erkannt
-
-Prüfe CUDA-Installation:
-```bash
-nvidia-smi
-```
-
-Falls CUDA nicht verfügbar, ändere in `dictation-simple.py` Zeile 22:
-```python
-DEVICE = "cpu"  # Nutzt CPU statt GPU
-```
-
-### Schlechte Erkennungsqualität
-
-- **Näher am Mikrofon sprechen**
-- **Hintergrundgeräusche reduzieren**
-- **Deutlich und nicht zu schnell sprechen**
-- Modell ist bereits `large-v3` (beste Qualität)
-
-### Daemon läuft nicht
-
-Prüfe Status:
-```bash
-pgrep -af dictation-simple.py
-```
-
-Starte manuell im Vordergrund:
-```bash
-~/.local/share/ai-dictation/venv/bin/python3 ~/.local/share/ai-dictation/dictation-simple.py
-```
-
-Logs anzeigen:
-```bash
-tail -f /tmp/dictation-daemon.log
-```
-
-## Systemressourcen
-
-- **Festplatte**: ~5 GB (large-v3 Modell + Dependencies)
-- **RAM (Leerlauf)**: ~50 MB (Daemon)
-- **RAM (Transkription)**: ~4-6 GB (Modell geladen)
-- **GPU-VRAM**: ~3 GB (large-v3 mit float16)
-- **CPU (Leerlauf)**: ~0%
-- **CPU (Transkription mit GPU)**: ~20-40%
-
-## Deinstallation
-
-```bash
-# Daemon stoppen
-pkill -f dictation-simple.py
-
-# Autostart entfernen (falls konfiguriert)
-rm ~/.config/autostart/ai-dictation.desktop
-
-# GNOME Shortcut entfernen (manuell via GNOME Einstellungen)
-
-# Alle Dateien löschen
-rm -rf ~/.local/share/ai-dictation
-
-# Cache leeren (optional)
-rm -rf ~/.cache/whisper
-```
-
-## Entwickelt mit
-
-- **Faster-Whisper** - Optimierte Speech-to-Text Engine (CTranslate2)
-- **PyTorch** - Machine Learning Framework
-- **CUDA** - GPU-Beschleunigung (NVIDIA)
-- **GTK3** - Animiertes Overlay
-- **GNOME** - Keyboard Shortcuts Integration
-- **sounddevice** - Audio-Aufnahme
-- **wl-copy** - Wayland Clipboard
-
-## Lizenz & Datenschutz
-
-- **100% lokal** - Keine Datenübertragung an externe Server
-- **Open Source** - Basiert auf OpenAI Whisper (MIT Lizenz)
-- **Privatsphäre** - Alle Aufnahmen werden nur temporär im RAM gehalten
-
----
-
-**Status**: Installiert und konfiguriert ✓
-**GPU**: NVIDIA mit CUDA ✓
-**Modell**: Faster-Whisper Large-v3 ✓
-**Sprache**: Deutsch ✓
-**Hotkey**: GNOME Shortcut (konfigurierbar) ✓
-**Overlay**: Animierte lila Wellen ✓
+- Code: siehe Repository
+- Modell: Cohere Transcribe, Apache 2.0, © Cohere
