@@ -6,6 +6,7 @@ Wird per Hotkey-Daemon getriggert
 
 import os
 import sys
+import mmap
 import time
 import subprocess
 import threading
@@ -130,6 +131,32 @@ MAX_GAIN = 150.0  # Deckel, damit Stille nicht zu erfundenem Text wird
 STATE_FILE = f"/tmp/dictation-state-{os.getenv('USER')}"
 OSD_FILE = f"/tmp/dictation-osd-{os.getenv('USER')}"
 
+# ─── Live-Pegel fuer das Overlay ─────────────────────────────────────────────
+#
+# Das Overlay zeigt, was wirklich am Mikrofon ankommt, statt einer
+# Sinus-Schleife. Der Audio-Callback schreibt dafuer Pegel, Spektrum und ein
+# Stueck Wellenform in eine kleine Datei im tmpfs, die beide Seiten per mmap
+# teilen. Eine Pipe kaeme nicht in Frage: liest das Overlay nicht schnell genug,
+# laeuft sie voll und blockiert den Audio-Callback - und damit die Aufnahme.
+# mmap blockiert nie; ein halb geschriebener Frame faellt bei 60 fps nicht auf.
+#
+# Aufbau (float32): [0] Zaehler, [1] Phase, [2] Pegel, [3] Stille-Schwelle,
+# [4] Anteil der Stille bis zum Auto-Stopp (0..1), [5] Sekunden seit Start,
+# [6] Anzahl Baender, [7] Anzahl Wellenpunkte, danach Baender, danach Welle.
+# Das Overlay liest [6] und [7] und braucht die Groessen deshalb nicht zu kennen.
+LIVE_FILE = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "ai-dictation-live.f32"
+)
+LIVE_HEADER = 8
+LIVE_FFT = 1024  # 64 ms bei 16 kHz, 15,6 Hz je Bin
+LIVE_BANDS = 28  # logarithmisch 120 Hz..7,6 kHz, im Overlay gespiegelt
+LIVE_BAND_MIN_HZ = 120.0
+LIVE_BAND_MAX_HZ = 7600.0
+LIVE_WAVE = 256  # die letzten LIVE_FFT Samples, je 4 zu einem Spitzenwert verdichtet
+PHASE_KALIBRIEREN = 0
+PHASE_AUFNAHME = 1
+PHASE_VERARBEITEN = 2
+
 # ─── Transkriptions-Dienst fuer andere lokale Programme ──────────────────────
 #
 # Das Modell belegt rund 4,7 G VRAM und bleibt nach dem ersten Diktat geladen.
@@ -194,11 +221,116 @@ def play_sound(sound_type="start"):
         print(f"[DEBUG] Sound-Fehler ({sound_type}): {e}")
 
 
+class LivePegel:
+    """Schreibt Pegel, Spektrum und Wellenform fuer das Overlay (siehe LIVE_FILE).
+
+    einspeisen() laeuft im Audio-Callback und darf dort nie werfen - eine
+    Exception im Callback beendet den Stream und damit die Aufnahme.
+    """
+
+    def __init__(self):
+        self._mm = None
+        self.werte = None
+        self._ring = np.zeros(LIVE_FFT, dtype=np.float32)
+        self._fenster = np.hanning(LIVE_FFT).astype(np.float32)
+        self._start = 0.0
+
+        # Bandgrenzen als Bin-Indizes, streng steigend: unten waeren zwei
+        # Baender sonst schmaler als ein Bin und zeigten denselben Wert.
+        bin_hz = SAMPLE_RATE / LIVE_FFT
+        grenzen = np.geomspace(LIVE_BAND_MIN_HZ, LIVE_BAND_MAX_HZ, LIVE_BANDS + 1) / bin_hz
+        grenzen = np.round(grenzen).astype(int)
+        for i in range(1, len(grenzen)):
+            grenzen[i] = max(grenzen[i], grenzen[i - 1] + 1)
+        self._grenzen = grenzen
+        self._breiten = np.diff(grenzen).astype(np.float32)
+
+    def oeffnen(self):
+        """Legt den Puffer an. Ist er schon offen, beginnt nur die Zeit neu."""
+        if self.werte is None:
+            groesse = (LIVE_HEADER + LIVE_BANDS + LIVE_WAVE) * 4
+            fd = os.open(LIVE_FILE, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+            try:
+                os.ftruncate(fd, groesse)
+                self._mm = mmap.mmap(fd, groesse)
+            finally:
+                os.close(fd)
+            self.werte = np.frombuffer(self._mm, dtype=np.float32)
+            self.werte[6] = LIVE_BANDS
+            self.werte[7] = LIVE_WAVE
+        self._ring[:] = 0.0
+        self._start = time.monotonic()
+        self.phase(PHASE_KALIBRIEREN)
+
+    def phase(self, phase):
+        werte = self.werte
+        if werte is not None:
+            werte[1] = phase
+            werte[0] += 1
+
+    def einspeisen(self, block, pegel, stille_anteil, schwelle):
+        werte = self.werte
+        if werte is None:
+            return
+        try:
+            n = len(block)
+            if n >= LIVE_FFT:
+                self._ring[:] = block[-LIVE_FFT:]
+            else:
+                self._ring[:-n] = self._ring[n:]
+                self._ring[-n:] = block
+
+            ring = self._ring - self._ring.mean()
+            leistung = np.abs(np.fft.rfft(ring * self._fenster)) ** 2
+            g = self._grenzen
+            baender = np.sqrt(np.add.reduceat(leistung[:g[-1]], g[:-1]) / self._breiten)
+
+            # Je 4 Samples der vorzeichenbehaftete Spitzenwert: dichter als jedes
+            # vierte Sample und ohne dass Spitzen durchs Raster fallen.
+            gruppen = ring.reshape(LIVE_WAVE, -1)
+            welle = gruppen[np.arange(LIVE_WAVE), np.abs(gruppen).argmax(axis=1)]
+
+            werte[2] = pegel
+            werte[3] = schwelle
+            werte[4] = stille_anteil
+            werte[5] = time.monotonic() - self._start
+            werte[LIVE_HEADER:LIVE_HEADER + LIVE_BANDS] = baender
+            werte[LIVE_HEADER + LIVE_BANDS:] = welle
+            werte[0] += 1
+        except Exception:
+            pass
+
+    def schliessen(self):
+        mm = self._mm
+        self.werte = None
+        self._mm = None
+        try:
+            os.remove(LIVE_FILE)
+        except OSError:
+            pass
+        if mm is not None:
+            try:
+                mm.close()
+            except BufferError:
+                # Ein Callback haelt gerade noch eine Sicht auf den Puffer -
+                # dann gibt ihn die Speicherbereinigung frei.
+                pass
+
+
+live_pegel = LivePegel()
+
+
 def start_overlay():
     """Startet das animierte Overlay."""
     global overlay_process
 
-    if overlay_process is not None:
+    # Auch bei laufendem Overlay: neue Aufnahme heisst Zeit und Phase neu.
+    try:
+        live_pegel.oeffnen()
+    except Exception as e:
+        print(f"[DEBUG] Live-Pegel nicht verfuegbar: {e}")
+
+    if overlay_process is not None and overlay_process.poll() is None:
         return  # Overlay läuft bereits
 
     try:
@@ -228,7 +360,7 @@ def stop_overlay():
         if os.path.exists(STATE_FILE):
             os.remove(STATE_FILE)
 
-        # Warte kurz auf sauberes Beenden
+        # Warte kurz auf sauberes Beenden (das Overlay blendet ~0,25 s aus)
         if overlay_process is not None:
             try:
                 overlay_process.wait(timeout=1)
@@ -236,6 +368,7 @@ def stop_overlay():
                 overlay_process.terminate()
             overlay_process = None
 
+        live_pegel.schliessen()
         print("[DEBUG] Overlay gestoppt")
     except Exception as e:
         print(f"[DEBUG] Overlay-Stopp-Fehler: {e}")
@@ -439,6 +572,7 @@ def record_audio():
 
         if total_frames < calibration_frames:
             calibration_levels.append(audio_level)
+            live_pegel.einspeisen(block, audio_level, 0.0, 0.0)
             return  # Waehrend der Kalibrierung nicht auf Stille pruefen
 
         if silence_threshold is None:
@@ -450,15 +584,21 @@ def record_audio():
                 SILENCE_THRESHOLD
             )
             print(f"[DEBUG] Grundrauschen {noise_floor:.5f} -> Stille-Schwelle {silence_threshold:.5f}")
+            live_pegel.phase(PHASE_AUFNAHME)
 
         if audio_level < silence_threshold:
             silence_frames += frames
-            if silence_frames >= max_silence_frames:
-                auto_stopped = True
-                print(f"[DEBUG] Auto-Stopp nach {PAUSE_THRESHOLD}s Pause")
-                raise sd.CallbackStop()
         else:
             silence_frames = 0  # Reset bei Sprache
+
+        live_pegel.einspeisen(
+            block, audio_level, min(silence_frames / max_silence_frames, 1.0), silence_threshold
+        )
+
+        if silence_frames >= max_silence_frames:
+            auto_stopped = True
+            print(f"[DEBUG] Auto-Stopp nach {PAUSE_THRESHOLD}s Pause")
+            raise sd.CallbackStop()
 
         if total_frames >= max_frames:
             raise sd.CallbackStop()
@@ -762,6 +902,10 @@ def process_dictation():
         return
 
     recording = True
+    # Gehoert das recording-Flag noch diesem Durchlauf? Waehrend der
+    # Transkription kann per Hotkey schon die naechste Aufnahme laufen - deren
+    # Flag und Overlay darf das finally unten dann nicht abraeumen.
+    nimmt_auf = True
 
     try:
         # 1. Starte Aufnahme mit Overlay
@@ -772,13 +916,16 @@ def process_dictation():
 
         audio_np, auto_stopped = record_audio()
 
-        # 3. Aufnahme beendet - Stoppe Overlay
-        stop_overlay()
+        # 3. Aufnahme beendet. Das Overlay bleibt stehen und zeigt bis zum
+        # fertigen Text den Verarbeiten-Zustand - beim ersten Diktat laedt
+        # das Modell einige Sekunden, ohne Anzeige saehe das nach Haenger aus.
+        live_pegel.phase(PHASE_VERARBEITEN)
         play_sound("stop")
 
         # Setze Recording-Flag zurück
         recording = False
         stop_recording_flag = False
+        nimmt_auf = False
 
         if audio_np is None or len(audio_np) < SAMPLE_RATE * 0.5:
             show_notification("⚠️ Aufnahme zu kurz", timeout=1500, urgency="normal", icon="dialog-warning")
@@ -808,10 +955,12 @@ def process_dictation():
         print(f"Fehler: {e}")
         show_notification(f"❌ Fehler: {e}", timeout=2000, urgency="critical", icon="dialog-error")
         play_sound("error")
-        stop_overlay()  # Sicherstellen dass Overlay geschlossen wird
     finally:
-        recording = False
-        stop_recording_flag = False
+        if nimmt_auf:
+            recording = False
+            stop_recording_flag = False
+        if not recording:
+            stop_overlay()  # Sicherstellen dass Overlay geschlossen wird
 
 
 def monitor_trigger_file():

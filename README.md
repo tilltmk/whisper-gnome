@@ -36,7 +36,11 @@ oder Störgeräusche ergeben höhere Fehlerraten. Ein typisches Diktat von
 - **Automatischer Stopp** nach 5 Sekunden Stille, höchstens 5 Minuten je Aufnahme
 - **Lange Diktate** werden an leisen Stellen in Stücke ≤ 35 s zerlegt (die Obergrenze des Modells)
 - **Pegel-Aufbereitung** für leise oder versetzte Mikrofone (DC-Abzug, Aussteuerung)
-- **Animiertes Overlay** während der Aufnahme
+- **Live-Overlay**, das zeigt, was wirklich am Mikrofon ankommt: Spektrum als Strahlenkranz
+  (tief unten, Zischlaute oben), die echte Wellenform als Ring, Aufnahmezeit, ein
+  Countdown bis zum Auto-Stopp bei Stille und ein Verarbeiten-Zustand, bis der Text
+  in der Zwischenablage ist. Der Daemon teilt die Daten per mmap
+  (`$XDG_RUNTIME_DIR/ai-dictation-live.f32`), damit der Audio-Callback nie blockiert.
 - **Transkriptions-Dienst** für andere lokale Programme über einen Unix-Socket (siehe unten)
 
 ## Voraussetzungen
@@ -86,10 +90,11 @@ systemctl --user enable --now ai-dictation.service
 
 ## Nutzung
 
-1. Tastenkürzel drücken – Ton und Overlay zeigen die laufende Aufnahme
+1. Tastenkürzel drücken – Ton und Overlay zeigen die laufende Aufnahme; der Rand
+   baut sich auf, solange das Grundrauschen gemessen wird (0,5 s)
 2. Sprechen
-3. Tastenkürzel erneut drücken oder 5 Sekunden schweigen
-4. `Strg+V` – der Text ist in der Zwischenablage
+3. Tastenkürzel erneut drücken oder 5 Sekunden schweigen (der Rand läuft dabei orange ab)
+4. Sobald das Overlay verschwindet: `Strg+V` – der Text ist in der Zwischenablage
 
 ## Speicher und Rückfallebenen
 
