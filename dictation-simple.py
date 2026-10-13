@@ -130,6 +130,25 @@ MAX_GAIN = 150.0  # Deckel, damit Stille nicht zu erfundenem Text wird
 STATE_FILE = f"/tmp/dictation-state-{os.getenv('USER')}"
 OSD_FILE = f"/tmp/dictation-osd-{os.getenv('USER')}"
 
+# ─── Transkriptions-Dienst fuer andere lokale Programme ──────────────────────
+#
+# Das Modell belegt rund 4,7 G VRAM und bleibt nach dem ersten Diktat geladen.
+# Eine zweite Kopie in einem anderen Programm passt nicht auf eine 8-G-Karte.
+# Deshalb bietet der Daemon das bereits geladene Modell ueber einen Unix-Socket
+# an: der Client legt Audio als float32-Rohdatei (16 kHz, mono) ab und schickt
+# die Abschnitte, der Daemon transkribiert sie stapelweise.
+#
+# Diktieren hat Vorrang: zwischen zwei Stapeln wird geprueft, ob ein Diktat auf
+# das Modell wartet - es wartet also hoechstens einen Stapel lang (~1-2 s GPU).
+# Auf der CPU werden fremde Auftraege abgelehnt: dort waere ein Video minuten-
+# bis stundenlang und mit ~8 G RAM beschaeftigt (siehe CPU_FALLBACK_...).
+ASR_SOCKET = os.path.join(
+    os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "ai-dictation-asr.sock"
+)
+ASR_SERVICE_BATCH = 4
+asr_lock = threading.Lock()          # schuetzt asr_model/asr_processor
+diktat_wartet = threading.Event()    # gesetzt, solange ein Diktat aufs Modell wartet
+
 # Globale Variablen
 recording = False
 stop_recording_flag = False
@@ -540,6 +559,16 @@ def transcribe_audio(audio_np):
     if audio_np is None or len(audio_np) == 0:
         return ""
 
+    # Vorrang vor dem Transkriptions-Dienst: das Event haelt ihn vor dem
+    # naechsten Stapel an, das Lock wartet hoechstens den laufenden ab.
+    diktat_wartet.set()
+    with asr_lock:
+        diktat_wartet.clear()
+        return _transcribe_audio_locked(audio_np)
+
+
+def _transcribe_audio_locked(audio_np):
+    """Wie transcribe_audio, Aufrufer haelt asr_lock."""
     # Lade Modell falls nicht geladen
     if asr_model is None:
         if not load_model():
@@ -587,6 +616,102 @@ def transcribe_audio(audio_np):
     except Exception as e:
         print(f"[FEHLER] Transkriptionsfehler: {e}")
         return ""
+
+
+def _asr_geraet():
+    try:
+        return str(next(asr_model.parameters()).device.type)
+    except Exception:
+        return "unbekannt"
+
+
+def _asr_auftrag(anfrage, senden):
+    """Fuehrt einen Auftrag des Transkriptions-Dienstes aus (siehe ASR_SOCKET)."""
+    aktion = anfrage.get("aktion")
+    if aktion == "status":
+        senden({"ok": True, "modell_geladen": asr_model is not None,
+                "geraet": _asr_geraet() if asr_model is not None else None})
+        return
+    if aktion != "transkribieren":
+        senden({"ok": False, "fehler": f"unbekannte Aktion {aktion!r}"})
+        return
+
+    pfad = Path(str(anfrage.get("audio", "")))
+    try:
+        st = pfad.stat()
+    except OSError as e:
+        senden({"ok": False, "fehler": f"Audio nicht lesbar: {e}"})
+        return
+    if pfad.suffix != ".f32" or not pfad.is_file() or st.st_uid != os.getuid():
+        senden({"ok": False, "fehler": "Audio muss eine eigene .f32-Datei sein"})
+        return
+    rate = int(anfrage.get("rate", SAMPLE_RATE))
+    sprache = str(anfrage.get("sprache", TRANSCRIBE_LANGUAGE))
+    abschnitte = [(int(a), int(n)) for a, n in anfrage.get("abschnitte", [])]
+    audio = np.memmap(pfad, dtype=np.float32, mode="r")
+
+    with asr_lock:
+        if asr_model is None and not load_model():
+            senden({"ok": False, "fehler": "Modell nicht ladbar (GPU-Speicher belegt?)"})
+            return
+        if _asr_geraet() != "cuda" and not anfrage.get("cpu_erlaubt"):
+            senden({"ok": False, "fehler": "Modell laeuft auf der CPU - Auftrag abgelehnt"})
+            return
+
+    texte = []
+    for i in range(0, len(abschnitte), ASR_SERVICE_BATCH):
+        while diktat_wartet.is_set():
+            time.sleep(0.05)
+        stapel = [np.array(audio[a:a + n], dtype=np.float32) for a, n in abschnitte[i:i + ASR_SERVICE_BATCH]]
+        with asr_lock:
+            if asr_model is None:
+                senden({"ok": False, "fehler": "Modell waehrend des Auftrags entladen"})
+                return
+            ergebnis = asr_model.transcribe(
+                processor=asr_processor, language=sprache, audio_arrays=stapel,
+                sample_rates=[rate] * len(stapel), batch_size=ASR_SERVICE_BATCH,
+            )
+        texte.extend((t or "").strip() for t in ergebnis)
+        senden({"fortschritt": len(texte), "gesamt": len(abschnitte)})
+    senden({"ok": True, "texte": texte})
+
+
+def asr_dienst():
+    """Unix-Socket-Server, ein Auftrag nach dem anderen. Laeuft als Daemon-Thread."""
+    import json
+    import socket
+
+    try:
+        os.unlink(ASR_SOCKET)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    alte_maske = os.umask(0o177)          # Socket nur fuer den eigenen Benutzer
+    try:
+        server.bind(ASR_SOCKET)
+    finally:
+        os.umask(alte_maske)
+    server.listen(2)
+    print(f"[INFO] Transkriptions-Dienst bereit: {ASR_SOCKET}")
+
+    while True:
+        verbindung, _ = server.accept()
+        with verbindung, verbindung.makefile("rwb") as datei:
+            def senden(obj):
+                datei.write((json.dumps(obj, ensure_ascii=False) + "\n").encode())
+                datei.flush()
+            try:
+                zeile = datei.readline()
+                if zeile:
+                    _asr_auftrag(json.loads(zeile), senden)
+            except (BrokenPipeError, ConnectionResetError):
+                print("[WARN] Transkriptions-Dienst: Client hat die Verbindung getrennt")
+            except Exception as e:
+                print(f"[FEHLER] Transkriptions-Dienst: {e}")
+                try:
+                    senden({"ok": False, "fehler": str(e)[:300]})
+                except OSError:
+                    pass
 
 
 def show_notification(message, timeout=1500, urgency="normal", icon="audio-input-microphone"):
@@ -750,6 +875,7 @@ def monitor_trigger_file():
 
 def main():
     """Hauptfunktion."""
+    threading.Thread(target=asr_dienst, daemon=True, name="asr-dienst").start()
     monitor_trigger_file()
 
 
