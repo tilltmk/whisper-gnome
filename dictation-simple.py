@@ -93,11 +93,20 @@ import numpy as np
 # Modell sehr langsam - aber immer noch besser als keine Diktierfunktion.
 COHERE_MODEL_PATH = str(Path.home() / ".cache" / "cohere-transcribe")
 TRANSCRIBE_LANGUAGE = "de"
-MAX_NEW_TOKENS = 440  # deckt die 300 s Hoechstaufnahmedauer ab
+# Stuecke je GPU-Durchlauf. transcribe() zerlegt in <=35-s-Stuecke; 300 s sind
+# also bis zu 9 Stuecke. Der Vorgabewert des Modells (128) wuerde alle auf
+# einmal rechnen - neben den 3,7 G Gewichten bleibt auf einer 8-G-Karte dafuer zu wenig.
+TRANSCRIBE_BATCH_SIZE = 4
 MODEL_CANDIDATES = [
     ("cuda", "bfloat16"),
     ("cpu", "float32"),
 ]
+# Die CPU-Ebene braucht rund 8 G Arbeitsspeicher und rechnet minutenlang. Ist
+# die GPU nur voruebergehend belegt, kann sie ein System mit knappem RAM per
+# vollem Swap zum Stehen bringen. Deshalb: bei GPU-Speichermangel NIE auf die CPU
+# ausweichen (beim naechsten Diktat wird die GPU erneut versucht), und die
+# CPU-Ebene nur nehmen, wenn so viel Speicher wirklich frei ist.
+CPU_FALLBACK_MIN_AVAILABLE_GB = 12
 
 # Konfiguration
 SAMPLE_RATE = 16000
@@ -240,6 +249,14 @@ def load_model():
         if device == "cuda" and not torch.cuda.is_available():
             print("[WARN] CUDA nicht verfuegbar, ueberspringe GPU")
             continue
+        if device == "cpu":
+            available_gb = mem_available_gb()
+            if available_gb < CPU_FALLBACK_MIN_AVAILABLE_GB:
+                print(
+                    f"[FEHLER] CPU-Ebene uebersprungen: nur {available_gb:.1f} G frei, "
+                    f"noetig {CPU_FALLBACK_MIN_AVAILABLE_GB} G"
+                )
+                continue
         try:
             print(f"[INFO] Lade Cohere Transcribe ({device}, {dtype_name})...")
             if asr_processor is None:
@@ -264,9 +281,28 @@ def load_model():
                     torch.cuda.empty_cache()
                 except Exception:
                     pass
+                # Volle GPU ist ein voruebergehender Zustand (anderer Prozess
+                # haelt VRAM) - kein Grund, den Rechner mit der CPU-Ebene zu
+                # ersticken. Abbrechen, beim naechsten Diktat neu versuchen.
+                if isinstance(e, torch.cuda.OutOfMemoryError):
+                    print("[FEHLER] GPU-Speicher belegt - keine CPU-Ebene, naechstes Diktat versucht es erneut")
+                    show_notification("Diktierung: Grafikspeicher belegt", urgency="critical")
+                    return False
 
     print("[FEHLER] Konnte Cohere Transcribe nicht laden")
     return False
+
+
+def mem_available_gb():
+    """Liest MemAvailable aus /proc/meminfo (in G)."""
+    try:
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / (1024 * 1024)
+    except OSError:
+        pass
+    return 0.0
 
 
 def has_default_source():
@@ -510,68 +546,36 @@ def transcribe_audio(audio_np):
             return ""
 
     try:
-        import torch
-
         duration = len(audio_np) / SAMPLE_RATE
         print(f"[INFO] Transkribiere {duration:.1f}s Audio...")
 
         audio_np = prepare_audio(audio_np)
 
-        # Der Prozessor erwartet float32-Mono. Er setzt die Abtastrate selbst um
-        # und zerlegt lange Aufnahmen in Stuecke; der dabei entstehende
-        # audio_chunk_index MUSS unten ans Dekodieren weitergegeben werden,
-        # sonst werden die Stuecke falsch zusammengesetzt.
-        inputs = asr_processor(
-            audio=np.asarray(audio_np, dtype=np.float32),
-            sampling_rate=SAMPLE_RATE,
-            return_tensors="pt",
+        # transcribe() des Modells und NICHT processor() + generate() von Hand.
+        # Der Handweg hatte zwei Fehler, die lange Diktate zerlegt haben:
+        #
+        # 1. Keine Zerlegung. Der Feature-Extractor rechnet die ganze Aufnahme
+        #    am Stueck, das Modell ist aber auf hoechstens 35 s ausgelegt
+        #    (config.json: max_audio_clip_s). Darueber hoert der Dekoder
+        #    mittendrin auf oder wiederholt den letzten Satz in Schleife.
+        #    transcribe() schneidet an der leisesten Stelle kurz vor 35 s
+        #    (split_audio_chunks_energy) und fuegt die Texte wieder zusammen.
+        # 2. Keine Sprache. processor(language="de") verschluckt das Argument
+        #    still in **kwargs - die Sprachmarke <|de|> steckt nur im
+        #    Text-Prompt aus build_prompt(). Ohne ihn hat das Modell geraten
+        #    und ist mitten im Satz ins Englische gekippt.
+        #
+        # Nebenbei faellt die "'NoneType' object has no attribute 'new_ones'"-
+        # Falle weg (transformers 4.57): transcribe() gibt einen Prompt mit und
+        # baut decoder_attention_mask daraus selbst, statt None zu uebergeben.
+        texts = asr_model.transcribe(
+            processor=asr_processor,
             language=TRANSCRIBE_LANGUAGE,
+            audio_arrays=[np.asarray(audio_np, dtype=np.float32)],
+            sample_rates=[SAMPLE_RATE],
+            batch_size=TRANSCRIBE_BATCH_SIZE,
         )
-        inputs = inputs.to(asr_model.device, dtype=asr_model.dtype)
-
-        # decoder_attention_mask MUSS hier mitgegeben werden, sonst bricht
-        # generate() ab mit "'NoneType' object has no attribute 'new_ones'".
-        # Grund: die generate() des Modells schreibt den Schluessel
-        # bedingungslos in die Argumente, auch als None - und das ist genau der
-        # Fall bei reiner Audio-Transkription ohne Textprompt. transformers
-        # 4.57.1 prueft in _update_model_kwargs_for_generation nur, OB der
-        # Schluessel da ist, nicht ob er einen Wert hat, und ruft dann
-        # .new_ones() darauf. Der Modellcode faengt 4.52-4.55 und >=5.3 ab,
-        # 4.57 fiel durch die Luecke.
-        #
-        # Eine Spalte Einsen ist inhaltlich korrekt: der Dekoder startet mit
-        # genau einem Token (decoder_start_token_id), und transformers haengt
-        # je Schritt selbst eine weitere Spalte an.
-        decoder_attention_mask = torch.ones(
-            (inputs["input_features"].shape[0], 1),
-            dtype=torch.long,
-            device=asr_model.device,
-        )
-
-        with torch.inference_mode():
-            outputs = asr_model.generate(
-                **inputs,
-                decoder_attention_mask=decoder_attention_mask,
-                max_new_tokens=MAX_NEW_TOKENS,
-            )
-
-        # batch_decode und NICHT decode: generate() liefert eine Zeile je
-        # Stapel-Eintrag, und die decode() des Prozessors reicht einfach an
-        # tokenizer.decode() weiter, die nur eine einzelne Sequenz kann
-        # ("int() argument must be ... not 'list'").
-        #
-        # Die Zusatzargumente audio_chunk_index und language aus dem
-        # Modell-Steckbrief werden bewusst NICHT uebergeben: dieser
-        # Modellspiegel kennt sie nicht (processing_cohere_asr.py reicht
-        # decode/batch_decode ungefiltert an den Tokenizer durch), der
-        # Steckbrief beschreibt eine neuere Prozessor-Fassung.
-        decoded = asr_processor.batch_decode(outputs, skip_special_tokens=True)
-        # decode() liefert bei diesem Modell eine Liste, bei anderen Pfaden einen
-        # String - beides abfangen, damit ein Modell-Update nichts zerreisst.
-        if isinstance(decoded, (list, tuple)):
-            text = " ".join(str(t).strip() for t in decoded if t).strip()
-        else:
-            text = str(decoded).strip()
+        text = (texts[0] if texts else "").strip()
 
         if text:
             print(f"[INFO] Transkribiert: {text[:100]}{'...' if len(text) > 100 else ''}")
