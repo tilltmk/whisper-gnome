@@ -88,8 +88,8 @@ import numpy as np
 # Genauigkeit der Mantisse, damit passt -1e9 und der Speicherbedarf bleibt bei
 # rund 4 G. GPUs ab Ampere (Compute Capability 8.0) rechnen bfloat16 in Hardware.
 #
-# float32 auf der GPU ist KEINE Option: 2B Parameter waeren rund 8 G, zu viel
-# fuer eine 8-G-Karte. Die CPU-Ebene ist nur eine Notloesung, auf ihr ist das
+# float32 auf der GPU ist auf 8-G-Karten KEINE Option: 2B Parameter waeren
+# rund 8 G. Die CPU-Ebene ist nur eine Notloesung, auf ihr ist das
 # Modell sehr langsam - aber immer noch besser als keine Diktierfunktion.
 COHERE_MODEL_PATH = str(Path.home() / ".cache" / "cohere-transcribe")
 TRANSCRIBE_LANGUAGE = "de"
@@ -114,8 +114,8 @@ MAX_RECORDING_TIME = 300  # 5 Minuten Maximum
 PAUSE_THRESHOLD = 5.0  # Automatischer Stopp nach 5 Sekunden Pause
 SILENCE_THRESHOLD = 0.02  # Obergrenze fuer die Stille-Schwelle (laute Mikrofone)
 
-# Pegel-Aufbereitung. Manches interne Laptop-Mikrofon (DMIC) liefert einen konstanten
-# Gleichspannungsanteil von ca. -0.23 und einen sehr leisen Nutzpegel. Ohne
+# Pegel-Aufbereitung. Manche internen Laptop-Mikrofone (DMIC) liefern einen
+# konstanten Gleichspannungsanteil (gemessen ca. -0.23) und einen sehr leisen Nutzpegel. Ohne
 # DC-Abzug misst jede Pegelmessung nur den Offset, und ohne Normalisierung
 # bekommt das Modell ein Signal um -50 dBFS.
 NOISE_CALIBRATION_TIME = 0.5  # Sekunden zur Messung des Grundrauschens
@@ -394,8 +394,8 @@ def open_input_stream(callback):
 def record_audio():
     """Nimmt Audio auf bis manuell gestoppt oder 8s Pause erkannt.
 
-    Oeffnet den Stream in einem eigenen Hintergrund-Thread. Mit dem USB-Mikro-
-    USB-Mikro (USB-Mikro) kann stream.close() beim Beenden 15-20s dauern oder
+    Oeffnet den Stream in einem eigenen Hintergrund-Thread. Mit manchen
+    USB-Mikrofonen kann stream.close() beim Beenden 15-20s dauern oder
     ganz haengen bleiben - PortAudio/ALSA-Teardown, keine Python-Exception,
     reproduzierbar bei praktisch jedem Stopp. Lief das synchron im Aufrufer
     (process_dictation), blieb dessen globales recording-Flag bis zum
