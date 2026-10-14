@@ -36,6 +36,9 @@ oder Störgeräusche ergeben höhere Fehlerraten. Ein typisches Diktat von
 - **Automatischer Stopp** nach 5 Sekunden Stille, höchstens 5 Minuten je Aufnahme
 - **Lange Diktate** werden an leisen Stellen in Stücke ≤ 35 s zerlegt (die Obergrenze des Modells)
 - **Pegel-Aufbereitung** für leise oder versetzte Mikrofone (DC-Abzug, Aussteuerung)
+- **Kein Schlusspunkt bei Kurzem**: einzelne Stichworte, kurze Phrasen (≤ 5 Wörter) und
+  Stichwortlisten kommen ohne Punkt am Ende; ganze Sätze, `?`, `!`, `...` und Abkürzungen
+  wie `usw.` bleiben unangetastet (`kurz_ohne_punkt()`)
 - **Live-Overlay**, das zeigt, was wirklich am Mikrofon ankommt: Spektrum als Strahlenkranz
   (tief unten, Zischlaute oben), die echte Wellenform als Ring, Aufnahmezeit, ein
   Countdown bis zum Auto-Stopp bei Stille und ein Verarbeiten-Zustand, bis der Text

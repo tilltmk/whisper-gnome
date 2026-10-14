@@ -5,6 +5,7 @@ Wird per Hotkey-Daemon getriggert
 """
 
 import os
+import re
 import sys
 import mmap
 import time
@@ -94,6 +95,15 @@ import numpy as np
 # Modell sehr langsam - aber immer noch besser als keine Diktierfunktion.
 COHERE_MODEL_PATH = str(Path.home() / ".cache" / "cohere-transcribe")
 TRANSCRIBE_LANGUAGE = "de"
+
+# Schlusspunkt bei Kurzem weglassen. Das Modell setzt hinter alles einen Punkt,
+# auch hinter ein einzelnes Stichwort - das wird dann mitten in ein Suchfeld oder
+# eine Liste eingefuegt. Der Modell-Schalter <|nopnc|> taugt dafuer nicht: er
+# nimmt ALLE Satzzeichen weg, auch Kommas und Punkte in ganzen Saetzen.
+KURZ_MAX_WOERTER = 5        # bis hierhin gilt eine einzelne Phrase als kurz
+LISTE_MAX_WOERTER = 3       # Stichwortliste: jedes Komma-Glied hoechstens so lang
+# Endet der Text auf eine Abkuerzung, gehoert der Punkt zu ihr und bleibt.
+ABKUERZUNGEN = {"usw", "etc", "bzw", "ca", "evtl", "ggf", "inkl", "zzgl", "nr", "dr", "str", "vgl", "z.b", "u.a", "d.h"}
 # Stuecke je GPU-Durchlauf. transcribe() zerlegt in <=35-s-Stuecke; 300 s sind
 # also bis zu 9 Stuecke. Der Vorgabewert des Modells (128) wuerde alle auf
 # einmal rechnen - neben den 3,7 G Gewichten bleibt auf einer 8-G-Karte dafuer zu wenig.
@@ -860,6 +870,32 @@ def show_notification(message, timeout=1500, urgency="normal", icon="audio-input
     return
 
 
+def kurz_ohne_punkt(text):
+    """Nimmt den Schlusspunkt weg, wenn nur eine kurze Phrase oder Stichworte diktiert wurden.
+
+    Ganze Saetze behalten ihren Punkt. Fragezeichen, Ausrufezeichen und
+    Auslassungspunkte bleiben immer - die traegt der Sprecher bewusst.
+    """
+    if not text.endswith(".") or text.endswith(".."):
+        return text
+    rumpf = text[:-1].rstrip()
+
+    # Mehr als ein Satz -> normaler Fliesstext, Punkt bleibt
+    if re.search(r"[.!?]\s", rumpf):
+        return text
+
+    woerter = rumpf.split()
+    if woerter and woerter[-1].lower().rstrip(".") in ABKUERZUNGEN:
+        return text
+
+    glieder = [g.split() for g in rumpf.split(",")]
+    stichwortliste = len(glieder) >= 2 and all(0 < len(g) <= LISTE_MAX_WOERTER for g in glieder)
+
+    if len(woerter) <= KURZ_MAX_WOERTER or stichwortliste:
+        return rumpf
+    return text
+
+
 def type_text(text):
     """Kopiert Text in Zwischenablage."""
     if not text:
@@ -934,7 +970,7 @@ def process_dictation():
 
         # 4. Transkribiere
         print("[DEBUG] Transkribiere...")
-        text = transcribe_audio(audio_np)
+        text = kurz_ohne_punkt(transcribe_audio(audio_np))
 
         if not text:
             print("[DEBUG] Kein Text erkannt!")
