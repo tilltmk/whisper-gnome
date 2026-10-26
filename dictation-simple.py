@@ -870,6 +870,21 @@ def show_notification(message, timeout=1500, urgency="normal", icon="audio-input
     return
 
 
+# Produktnamen, die das Modell falsch hoert ("Claude" klingt fuer es wie "Cloud").
+# Nur feste Wendungen: "Cloud" allein bleibt, das ist auch ein echtes Wort
+# (Nextcloud, Cloud-Server).
+FACHBEGRIFFE = [
+    (re.compile(r"\bCloud[- ](Code|CLI|Desktop|Instanz|Instanzen|Sitzung|Sitzungen)\b", re.IGNORECASE),
+     lambda m: "Claude" + m.group(0)[5] + ("CLI" if m.group(1).lower() == "cli" else m.group(1).capitalize())),
+]
+
+
+def fachbegriffe(text):
+    for muster, ersatz in FACHBEGRIFFE:
+        text = muster.sub(ersatz, text)
+    return text
+
+
 def kurz_ohne_punkt(text):
     """Nimmt den Schlusspunkt weg, wenn nur eine kurze Phrase oder Stichworte diktiert wurden.
 
@@ -970,7 +985,7 @@ def process_dictation():
 
         # 4. Transkribiere
         print("[DEBUG] Transkribiere...")
-        text = kurz_ohne_punkt(transcribe_audio(audio_np))
+        text = kurz_ohne_punkt(fachbegriffe(transcribe_audio(audio_np)))
 
         if not text:
             print("[DEBUG] Kein Text erkannt!")
