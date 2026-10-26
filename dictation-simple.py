@@ -916,19 +916,22 @@ def type_text(text):
     if not text:
         return False
 
+    letztes_diktat_sichern(text)
     try:
-        # Kopiere Text in Zwischenablage mit --paste-once
-        # Dies beendet den Prozess sauber nach dem ersten Einfügen
+        # --paste-once: der Hintergrundprozess endet nach dem ersten Einfuegen.
+        # stdout/stderr NICHT als Pipe: der Hintergrundprozess erbt sie, und
+        # communicate() wartete dann bis zum Einfuegen - wer nicht binnen 5 s
+        # einfuegte, bekam "Timeout beim Kopieren" (26.10.2026, 53-s-Diktat weg).
         process = subprocess.Popen(
             ["wl-copy", "--paste-once"],
             stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL
         )
         stdout, stderr = process.communicate(input=text.encode('utf-8'), timeout=5)
 
         if process.returncode != 0:
-            print(f"[DEBUG] wl-copy Fehler (Code {process.returncode}): {stderr.decode() if stderr else 'unbekannt'}")
+            print(f"[DEBUG] wl-copy Fehler (Code {process.returncode})")
             return False
 
         print(f"[DEBUG] Text in Zwischenablage kopiert")
@@ -940,6 +943,24 @@ def type_text(text):
     except Exception as e:
         print(f"[DEBUG] Fehler beim Kopieren: {e}")
         return False
+
+
+LETZTE_DIKTATE = Path.home() / ".local" / "state" / "ai-dictation" / "letzte.txt"
+LETZTE_DIKTATE_MAX = 20
+
+
+def letztes_diktat_sichern(text):
+    """Haelt die letzten Diktate lokal (nur fuer den Nutzer lesbar), damit ein
+    Fehler beim Einfuegen den Text nicht mehr vernichtet."""
+    try:
+        LETZTE_DIKTATE.parent.mkdir(parents=True, exist_ok=True)
+        alt = LETZTE_DIKTATE.read_text(encoding="utf-8").split("\n\x1e\n") if LETZTE_DIKTATE.exists() else []
+        eintrag = time.strftime("%Y-%m-%d %H:%M:%S") + "\n" + text
+        neu = (alt + [eintrag])[-LETZTE_DIKTATE_MAX:]
+        LETZTE_DIKTATE.write_text("\n\x1e\n".join(neu), encoding="utf-8")
+        LETZTE_DIKTATE.chmod(0o600)
+    except Exception as e:
+        print(f"[DEBUG] Diktat nicht gesichert: {e}")
 
 
 def process_dictation():
