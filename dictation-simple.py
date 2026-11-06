@@ -874,7 +874,7 @@ def show_notification(message, timeout=1500, urgency="normal", icon="audio-input
 # Nur feste Wendungen: "Cloud" allein bleibt, das ist auch ein echtes Wort
 # (Nextcloud, Cloud-Server).
 FACHBEGRIFFE = [
-    (re.compile(r"\bCloud[- ](Code|Codes|CLI|Desktop|Chrome|Instanz|Instanzen|Sitzung|Sitzungen|Account|Accounts|Konto|Konten|Abo)\b", re.IGNORECASE),
+    (re.compile(r"\bCloud[- ](Code|Codes|CLI|Desktop|Chrome|Instanz|Instanzen|Sitzung|Sitzungen|Account|Accounts|Konto|Konten|Abo|Chat|Chats|Opus|Sonnet|Haiku|Fable)\b", re.IGNORECASE),
      lambda m: "Claude" + m.group(0)[5] + ("CLI" if m.group(1).lower() == "cli" else m.group(1).capitalize())),
     (re.compile(r"\bCloud[-. ]MD\b", re.IGNORECASE), "CLAUDE.md"),
     (re.compile(r"\bSuper[- ]?base\b", re.IGNORECASE), "Supabase"),
