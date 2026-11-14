@@ -452,19 +452,38 @@ def load_model():
                     return False
 
     print("[FEHLER] Konnte Cohere Transcribe nicht laden")
+    # Sonst sieht der Nutzer nur das Overlay und nie einen Text (14.11.2026:
+    # NVIDIA-Kernelmodul und -Bibliotheken nach Update verschieden, CUDA tot).
+    show_notification("Diktierung: Modell nicht ladbar - GPU/Treiber pruefen (nvidia-smi)", timeout=5000, urgency="critical", icon="dialog-error")
     return False
 
 
 def mem_available_gb():
-    """Liest MemAvailable aus /proc/meminfo (in G)."""
+    """Freier Speicher in G: MemAvailable, gedeckelt durch MemoryHigh der eigenen cgroup.
+
+    Am 14.11.2026 meldete /proc/meminfo 15 G frei, der Dienst stand aber unter
+    MemoryHigh=5G (50-memory.conf). Die CPU-Ebene (~8 G) wurde trotzdem gestartet
+    und hing gedrosselt im Swap, statt abzulehnen - die Diktierfunktion war tot.
+    """
+    frei = 0.0
     try:
         with open("/proc/meminfo") as f:
             for line in f:
                 if line.startswith("MemAvailable:"):
-                    return int(line.split()[1]) / (1024 * 1024)
+                    frei = int(line.split()[1]) / (1024 * 1024)
+                    break
     except OSError:
         pass
-    return 0.0
+    try:
+        with open("/proc/self/cgroup") as f:
+            gruppe = Path("/sys/fs/cgroup") / f.read().strip().split("::", 1)[1].lstrip("/")
+        grenze = (gruppe / "memory.high").read_text().strip()
+        if grenze != "max":
+            belegt = int((gruppe / "memory.current").read_text())
+            frei = min(frei, (int(grenze) - belegt) / 1024 ** 3)
+    except (OSError, IndexError, ValueError):
+        pass
+    return frei
 
 
 def has_default_source():
