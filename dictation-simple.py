@@ -953,32 +953,36 @@ def type_text(text):
         return False
 
     letztes_diktat_sichern(text)
-    try:
-        # --paste-once: der Hintergrundprozess endet nach dem ersten Einfuegen.
-        # stdout/stderr NICHT als Pipe: der Hintergrundprozess erbt sie, und
-        # communicate() wartete dann bis zum Einfuegen - wer nicht binnen 5 s
-        # einfuegte, bekam "Timeout beim Kopieren" (26.10.2026, 53-s-Diktat weg).
-        process = subprocess.Popen(
-            ["wl-copy", "--paste-once"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL
-        )
-        stdout, stderr = process.communicate(input=text.encode('utf-8'), timeout=5)
+    # GNOME kennt kein data-control: wl-copy braucht kurz ein eigenes Fenster mit Fokus. Selten
+    # (13.11. und 17.11.2026, 2 von 1113 Diktaten) bekommt es den nie und haengt; ein neuer
+    # wl-copy-Prozess klappt dann meist. Deshalb bis zu drei Versuche statt Text verwerfen.
+    for versuch in range(1, 4):
+        try:
+            # --paste-once: der Hintergrundprozess endet nach dem ersten Einfuegen.
+            # stdout/stderr NICHT als Pipe: der Hintergrundprozess erbt sie, und
+            # communicate() wartete dann bis zum Einfuegen - wer nicht binnen 5 s
+            # einfuegte, bekam "Timeout beim Kopieren" (26.10.2026, 53-s-Diktat weg).
+            process = subprocess.Popen(
+                ["wl-copy", "--paste-once"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+            process.communicate(input=text.encode('utf-8'), timeout=5)
 
-        if process.returncode != 0:
-            print(f"[DEBUG] wl-copy Fehler (Code {process.returncode})")
+            if process.returncode != 0:
+                print(f"[DEBUG] wl-copy Fehler (Code {process.returncode}), Versuch {versuch}")
+                continue
+
+            print(f"[DEBUG] Text in Zwischenablage kopiert" + (f" (Versuch {versuch})" if versuch > 1 else ""))
+            return True
+        except subprocess.TimeoutExpired:
+            print(f"[DEBUG] Timeout beim Kopieren in Zwischenablage, Versuch {versuch}")
+            process.kill()
+        except Exception as e:
+            print(f"[DEBUG] Fehler beim Kopieren: {e}")
             return False
-
-        print(f"[DEBUG] Text in Zwischenablage kopiert")
-        return True
-    except subprocess.TimeoutExpired:
-        print(f"[DEBUG] Timeout beim Kopieren in Zwischenablage")
-        process.kill()
-        return False
-    except Exception as e:
-        print(f"[DEBUG] Fehler beim Kopieren: {e}")
-        return False
+    return False
 
 
 LETZTE_DIKTATE = Path.home() / ".local" / "state" / "ai-dictation" / "letzte.txt"
@@ -1056,7 +1060,8 @@ def process_dictation():
             play_sound("success")
         else:
             print("[DEBUG] Fehler beim Kopieren!")
-            show_notification("❌ Fehler beim Kopieren", timeout=1500, urgency="normal", icon="dialog-error")
+            show_notification(f"❌ Nicht in die Zwischenablage gekommen – Text gesichert in {LETZTE_DIKTATE}",
+                              timeout=10000, urgency="critical", icon="dialog-error")
             play_sound("error")
 
     except Exception as e:
