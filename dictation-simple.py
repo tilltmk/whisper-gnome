@@ -954,10 +954,19 @@ def type_text(text):
         return False
 
     letztes_diktat_sichern(text)
-    # GNOME kennt kein data-control: wl-copy braucht kurz ein eigenes Fenster mit Fokus. Selten
-    # (13.11. und 17.11.2026, 2 von 1113 Diktaten) bekommt es den nie und haengt; ein neuer
-    # wl-copy-Prozess klappt dann meist. Deshalb bis zu drei Versuche statt Text verwerfen.
-    for versuch in range(1, 4):
+    # GNOME kennt kein data-control: wl-copy braucht kurz ein eigenes Fenster mit Fokus. Mutter
+    # verweigert den manchmal (13.11., 17.11.; am 18.11. um 01:52 zweimal je drei Versuche in Folge).
+    # xclip setzt die X11-Zwischenablage ohne Fokus, Mutter reicht sie an Wayland weiter.
+    for versuch in (1, 2):
+        if versuch == 2:
+            try:
+                subprocess.run(["xclip", "-selection", "clipboard"], input=text.encode('utf-8'),
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5, check=True)
+                print("[DEBUG] Text in Zwischenablage kopiert (xclip)")
+                return True
+            except Exception as e:
+                print(f"[DEBUG] xclip-Rueckfall gescheitert: {e}")
+                return False
         try:
             # --paste-once: der Hintergrundprozess endet nach dem ersten Einfuegen.
             # stdout/stderr NICHT als Pipe: der Hintergrundprozess erbt sie, und
