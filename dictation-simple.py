@@ -908,7 +908,8 @@ FACHBEGRIFFE = [
     # Eigene Namen. UltraNOS in einer Domain (ultranos.de) bleibt klein.
     (re.compile(r"\bUltra[- ]?N(?:os|oss|us|ous|ose)\b", re.IGNORECASE),
      lambda m: "ultranos" if re.match(r"\.[a-z]", m.string[m.end():]) else "UltraNOS"),
-    (re.compile(r"\b(?:Click|Klick)[- ]?(?:Candid|Candit|Kandid|Kandit|Handed|Handid|Handit|Cannon|Bandit)(?=s?\b)", re.IGNORECASE),
+    # "Click Candidate" kam am 18.11. (Betreiber: "Click Candidate Server Reset").
+    (re.compile(r"\b(?:Click|Klick)[- ]?(?:Candidate|Candid|Candit|Kandidat|Kandid|Kandit|Handed|Handid|Handit|Cannon|Bandit)(?=s?\b)", re.IGNORECASE),
      "ClickCandit"),
     # Candit = der KI-Assistent in ClickCandit; "Kandidat" faellt nicht darunter.
     (re.compile(r"\b(?:Candid|Kandid|Kandit)(?=s?\b)", re.IGNORECASE), "Candit"),
